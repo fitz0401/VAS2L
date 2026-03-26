@@ -7,17 +7,8 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
-
-try:
-	from vision_module.mask_generator import MaskGenerator
-	from vision_module.som_generator import SoMGenerator
-except ImportError:
-	import sys
-	workspace_root = Path(__file__).resolve().parent.parent
-	if str(workspace_root) not in sys.path:
-		sys.path.insert(0, str(workspace_root))
-	from vision_module.mask_generator import MaskGenerator
-	from vision_module.som_generator import SoMGenerator
+from vision_module.mask_generator import MaskGenerator
+from vision_module.som_generator import SoMGenerator
 
 
 class StateAbstraction:

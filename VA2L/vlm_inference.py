@@ -11,7 +11,7 @@ class VLMInference:
         self.model = model.lower()
         if model_id is None:
             if self.model == "qwen":
-                model_id = "Qwen/Qwen3.5-4B"
+                model_id = "Qwen/Qwen3-VL-4B-Instruct"
             elif self.model == "gemma":
                 model_id = "google/gemma-3-4b-it"
             else:
@@ -41,25 +41,21 @@ class VLMInference:
         """
         messages = [
             {
-                "role": "system",
-                "content": [{"type": "text", "text": "You are a robot task intent recognition assistant."}]
-            },
-            {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": image},
-                    {"type": "text", "text": instruction}
-                ]
-            }
+                    {"type": "text", "text": instruction},
+                ],
+            },
         ]
 
         inputs = self.processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="pt"
-        )
-
-        target_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        inputs = inputs.to(self.model_obj.device, dtype=target_dtype)
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model_obj.device)
 
         input_len = inputs["input_ids"].shape[-1]
 

@@ -12,7 +12,12 @@
 # Modified by Richard Abrich from https://github.com/OpenAdaptAI/OpenAdapt
 
 # from https://github.com/pytorch/extension-cpp/issues/71#issuecomment-1778326052
-CUDA_VERSION=$(/usr/local/cuda/bin/nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
+NVCC_BIN="${CUDA_HOME}/bin/nvcc"
+if [ ! -x "$NVCC_BIN" ]; then
+    echo "nvcc not found at $NVCC_BIN. Please set CUDA_HOME or install CUDA Toolkit."
+    exit 1
+fi
+CUDA_VERSION=$($NVCC_BIN --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
 if [[ ${CUDA_VERSION} == 9.0* ]]; then
     export TORCH_CUDA_ARCH_LIST="3.5;5.0;6.0;7.0+PTX"
 elif [[ ${CUDA_VERSION} == 9.2* ]]; then

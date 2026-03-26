@@ -20,15 +20,11 @@ from pathlib import Path
 file_path = os.path.dirname(os.path.abspath(__file__))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Add XMem2 to path for mask tracking
-XMEM_PATH = '/home/u0177383/XMem2'
-if os.path.exists(XMEM_PATH) and XMEM_PATH not in sys.path:
-    sys.path.insert(0, XMEM_PATH)
-
 class MaskGenerator:
     def __init__(self):
-        self.ckpt_path = '/home/u0177383/doi_policy/ckpts'
-        self.config_path = '/home/u0177383/doi_policy/foci_real_world/configs'
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        self.ckpt_path = os.path.join(project_root, 'ckpts')
+        self.config_path = os.path.join(project_root, 'configs')
         self.device = device
         self.dino, self.sam = self._prepare_dino_and_sam()
 
@@ -138,113 +134,3 @@ class MaskGenerator:
             if save_path is not None:
                 mask_annotated_img_pil.save(save_path)
         return masks[:, 0]
-    
-    def track_masks_with_xmem(self, demo_dir, object_name, initial_mask, verbose=False):
-        """ Run XMem++ tracking on a demo directory. """
-        if not os.path.isdir(XMEM_PATH):
-            if verbose:
-                print("Warning: XMem++ not available, falling back to mask reuse")
-            return {'masks': {}, 'success': False}
-        
-        demo_path = Path(demo_dir).expanduser().resolve()
-        imgs_path = str(demo_path / 'color')
-        masks_path = str(demo_path / 'mask' / object_name)
-        output_path = str(demo_path / f'xmem_output_{object_name}')
-        
-        # Create mask directory and save initial mask
-        mask_dir = Path(masks_path)
-        mask_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save initial mask for frame 0.
-        mask_with_id = (initial_mask > 0).astype(np.uint8)
-        frame0_candidates = sorted((demo_path / 'color').glob('*.png'))
-        frame0_name = frame0_candidates[0].name if frame0_candidates else '00000.png'
-        initial_mask_path = mask_dir / frame0_name
-        cv2.imwrite(str(initial_mask_path), mask_with_id)
-        
-        if verbose:
-            print(f"Running XMem++ tracking for {object_name}...")
-            print(f"  Input images: {imgs_path}")
-            print(f"  Initial mask: {initial_mask_path}")
-            print(f"  Output: {output_path}")
-        
-        # Run XMem++ tracking with first frame annotation
-        frames_with_masks = [0]  # Only annotate first frame
-
-        # Use subprocess with spawn start method to avoid: "Cannot re-initialize CUDA in forked subprocess" from DataLoader workers.
-        payload = {
-            'imgs_path': imgs_path,
-            'masks_path': masks_path,
-            'output_path': output_path,
-            'frames_with_masks': frames_with_masks,
-            'xmem_path': XMEM_PATH,
-        }
-        subprocess_code = (
-            "import json, os, sys, multiprocessing as mp\n"
-            "mp.set_start_method('spawn', force=True)\n"
-            "payload = json.loads(os.environ['XMEM_PAYLOAD'])\n"
-            "xmem_path = payload['xmem_path']\n"
-            "if xmem_path not in sys.path:\n"
-            "    sys.path.insert(0, xmem_path)\n"
-            "import inference.run_on_video as rov\n"
-            "from inference.data.video_reader import VideoReader\n"
-            "from torch.utils.data import DataLoader\n"
-            "def _create_dataloaders_single_worker(imgs_in_path, masks_in_path, config):\n"
-            "    vid_reader = VideoReader('', imgs_in_path, masks_in_path, size=config['size'], use_all_masks=True)\n"
-            "    loader = DataLoader(vid_reader, batch_size=None, shuffle=False, num_workers=0, collate_fn=VideoReader.collate_fn_identity)\n"
-            "    vid_length = len(loader)\n"
-            "    config['enable_long_term_count_usage'] = (\n"
-            "        config['enable_long_term'] and\n"
-            "        (vid_length / (config['max_mid_term_frames'] - config['min_mid_term_frames']) * config['num_prototypes']) >= config['max_long_term_elements']\n"
-            "    )\n"
-            "    return vid_reader, loader\n"
-            "rov._create_dataloaders = _create_dataloaders_single_worker\n"
-            "rov.run_on_video(payload['imgs_path'], payload['masks_path'], payload['output_path'], payload['frames_with_masks'])\n"
-            "print('__XMEM_OK__')\n"
-        )
-
-        env = os.environ.copy()
-        env['XMEM_PAYLOAD'] = json.dumps(payload)
-        try:
-            result = subprocess.run(
-                [sys.executable, '-c', subprocess_code],
-                cwd=XMEM_PATH,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout or '').strip()
-                print(f"XMem++ tracking failed: {err}")
-                return {'masks': {}, 'success': False}
-            if verbose and result.stdout:
-                print(result.stdout.strip())
-        except Exception as e:
-            print(f"XMem++ tracking failed: {e}")
-            return {'masks': {}, 'success': False}
-        
-        # Load tracked masks from the default XMem output folder.
-        tracked_masks = {}
-        output_mask_dir = Path(output_path) / 'masks'
-        if not output_mask_dir.exists():
-            if verbose:
-                print(f"Warning: XMem++ masks not found at {output_mask_dir}")
-            return {'masks': {}, 'success': False}
-        mask_files = sorted(output_mask_dir.glob('*.png'))
-        for mask_file in mask_files:
-            try:
-                frame_idx = int(mask_file.stem)
-            except ValueError:
-                continue
-            mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                continue
-            # Convert from object IDs to binary mask (0/1)
-            mask_binary = (mask > 0).astype(np.uint8)
-            tracked_masks[frame_idx] = mask_binary
-        
-        if verbose:
-            print(f"  Loaded {len(tracked_masks)} tracked masks")
-        
-        return {'masks': tracked_masks, 'success': len(tracked_masks) > 0}
