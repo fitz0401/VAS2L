@@ -39,3 +39,10 @@ pip install timm==0.9.12
 
 # Tips: `hf auth login` for using --model gemma
 ```
+
+## Dataset
+Ref: https://droid-dataset.github.io/droid/the-droid-dataset.html
+```
+
+
+```

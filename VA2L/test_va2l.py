@@ -1,16 +1,22 @@
 import argparse
 from pathlib import Path
 from PIL import Image
-from state_abstraction import StateAbstraction
 
 
 def test_state_abstraction(args) -> None:
     """Test only state abstraction module: prepare and save VLM inputs."""
+    from state_abstraction import StateAbstraction
+
     print(f"\n=== Testing State Abstraction ===")
     print(f"Demo dir: {args.demo_dir}")
     print(f"Time step: {args.t}, History window: {args.k}")
 
-    abstracter = StateAbstraction(demo_dir=args.demo_dir, window_size=args.k)
+    abstracter = StateAbstraction(
+        demo_dir=args.demo_dir,
+        window_size=args.k,
+        manipulation_backend=args.backend,
+        yolo_model_path=args.yolo_model_path,
+    )
     image, instruction = abstracter.prepare_vlm_inputs(args.t)
 
     out_image = Path(args.out_image)
@@ -44,10 +50,16 @@ def test_vlm_inference(args) -> None:
     
     print(f"Loaded image: {out_image}")
     print(f"Loaded instruction from: {out_instruction}")
-    print(f"\nInitializing Gemma-3 model...")
+    print(f"\nInitializing {args.model.upper()} {args.model_size} model...")
     
-    vlm = VLMInference(model=args.model, model_id=None, device=args.device)
-    result = vlm.infer(image, instruction, max_tokens=150)
+    vlm = VLMInference(
+        model=args.model,
+        model_size=args.model_size,
+        model_id=None,
+        device=args.device,
+        precision=args.precision,
+    )
+    result = vlm.infer(image, instruction)
     
     out_result = Path(str(out_instruction).replace(".txt", "_vlm_result.txt"))
     out_result.write_text(result, encoding="utf-8")
@@ -59,14 +71,19 @@ def test_vlm_inference(args) -> None:
 
 def test_full_pipeline(args) -> None:
     """Test full pipeline: state abstraction + VLM inference."""
-    from vlm_inference import VLMInference
+    from state_abstraction import StateAbstraction
 
     print(f"\n=== Testing Full VA2L Pipeline ===")
     print(f"Demo dir: {args.demo_dir}")
     print(f"Time step: {args.t}, History window: {args.k}")
     
     print(f"\nStep 1: State Abstraction")
-    abstracter = StateAbstraction(demo_dir=args.demo_dir, window_size=args.k)
+    abstracter = StateAbstraction(
+        demo_dir=args.demo_dir,
+        window_size=args.k,
+        manipulation_backend=args.backend,
+        yolo_model_path=args.yolo_model_path,
+    )
     image, instruction = abstracter.prepare_vlm_inputs(args.t)
     
     out_image = Path(args.out_image)
@@ -79,8 +96,16 @@ def test_full_pipeline(args) -> None:
     print(f"✓ State abstraction done: {out_image}, {out_instruction}")
     
     print(f"\nStep 2: VLM Inference")
-    vlm = VLMInference(model=args.model, model_id=None, device=args.device)
-    result = vlm.infer(image, instruction, max_tokens=150)
+    from vlm_inference import VLMInference
+
+    vlm = VLMInference(
+        model=args.model,
+        model_size=args.model_size,
+        model_id=None,
+        device=args.device,
+        precision=args.precision,
+    )
+    result = vlm.infer(image, instruction)
     
     out_result = Path(str(out_instruction).replace(".txt", "_vlm_result.txt"))
     out_result.write_text(result, encoding="utf-8")
@@ -131,6 +156,33 @@ def main() -> None:
         choices=["qwen", "gemma"],
         default="qwen",
         help="VLM model selection: qwen / gemma",
+    )
+    parser.add_argument(
+        "--model_size",
+        type=str,
+        choices=["base", "small"],
+        default="base",
+        help="Model size selection: base / small",
+    )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["auto", "fp16", "bf16", "fp32"],
+        default="auto",
+        help="Model precision: auto / fp16 / bf16 / fp32",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["sam", "yolo"],
+        default="sam",
+        help="Manipulation backend for state abstraction: sam (current pipeline) or yolo.",
+    )
+    parser.add_argument(
+        "--yolo_model_path",
+        type=str,
+        default="yolov8l-worldv2.pt",
+        help="YOLO weights path used when --backend yolo is selected.",
     )
     args = parser.parse_args()
 
