@@ -4,14 +4,16 @@ import argparse
 import csv
 import importlib
 import queue
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
+from VA2L.state_abstraction import build_state_abstraction_frame
+from VA2L.utils.evaluate_droid_results import evaluate_experiment_results, save_experiment_results
+from VA2L.utils.preprocess_droid_subtasks import build_subtask_gt_sets, load_subtask_gt_sets, save_subtask_gt_sets
 
 
 def _decode_if_bytes(value: Any) -> Any:
@@ -46,6 +48,17 @@ def _find_image_key(first_step: Dict[str, Any], explicit_key: Optional[str]) -> 
 	raise RuntimeError("No image tensor found in observation.")
 
 
+def _find_wrist_key(first_step: Dict[str, Any], explicit_key: Optional[str]) -> Optional[str]:
+	obs = first_step.get("observation", {})
+	if explicit_key is not None:
+		return explicit_key if explicit_key in obs else None
+	for key, value in obs.items():
+		if "wrist" in key and isinstance(value, np.ndarray) and value.ndim == 3 and value.shape[-1] in (1, 3, 4):
+			if value.dtype == np.uint8:
+				return key
+	return None
+
+
 def _normalize_rgb(image: np.ndarray) -> np.ndarray:
 	if image.dtype != np.uint8:
 		image = image.astype(np.uint8)
@@ -56,116 +69,6 @@ def _normalize_rgb(image: np.ndarray) -> np.ndarray:
 	if image.shape[-1] == 4:
 		return image[..., :3]
 	return image
-
-
-def _compute_diff_bbox(a_rgb: np.ndarray, b_rgb: np.ndarray, diff_threshold: int, min_diff_area: int) -> Optional[Tuple[int, int, int, int]]:
-	import cv2
-	diff = cv2.absdiff(a_rgb, b_rgb)
-	gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
-	_, binary = cv2.threshold(gray, diff_threshold, 255, cv2.THRESH_BINARY)
-	binary = cv2.medianBlur(binary, 5)
-	contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-	if not contours:
-		return None
-
-	best = max(contours, key=cv2.contourArea)
-	if float(cv2.contourArea(best)) < float(min_diff_area):
-		return None
-
-	x, y, w, h = cv2.boundingRect(best)
-	return x, y, x + w, y + h
-
-
-def _bbox_center(bbox: Optional[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int]]:
-	if bbox is None:
-		return None
-	x1, y1, x2, y2 = bbox
-	return int(round((x1 + x2) / 2.0)), int(round((y1 + y2) / 2.0))
-
-
-def _draw_motion_overlay(
-	current_rgb: np.ndarray,
-	one_sec_rgb: np.ndarray,
-	two_sec_rgb: np.ndarray,
-	diff_threshold: int,
-	min_diff_area: int,
- 	show_prev_bbox: bool = False,
-) -> Image.Image:
-	canvas = Image.fromarray(current_rgb.copy())
-	draw = ImageDraw.Draw(canvas)
-
-	prev_bbox = _compute_diff_bbox(one_sec_rgb, two_sec_rgb, diff_threshold, min_diff_area)
-	cur_bbox = _compute_diff_bbox(current_rgb, one_sec_rgb, diff_threshold, min_diff_area)
-
-	if show_prev_bbox and prev_bbox is not None:
-		draw.rectangle(prev_bbox, outline=(160, 160, 160), width=2)
-	if cur_bbox is not None:
-		draw.rectangle(cur_bbox, outline=(255, 255, 255), width=3)
-
-	start_pt = _bbox_center(prev_bbox)
-	end_pt = _bbox_center(cur_bbox)
-	if start_pt is not None and end_pt is not None:
-		draw.line([start_pt, end_pt], fill=(255, 80, 70), width=4)
-		dx = end_pt[0] - start_pt[0]
-		dy = end_pt[1] - start_pt[1]
-		norm = float(np.hypot(dx, dy))
-		if norm > 1e-6:
-			ux, uy = dx / norm, dy / norm
-			head_len = 12.0
-			head_w = 7.0
-			tip = np.array([end_pt[0], end_pt[1]], dtype=np.float64)
-			base = tip - head_len * np.array([ux, uy], dtype=np.float64)
-			perp = np.array([-uy, ux], dtype=np.float64)
-			left = base + head_w * perp
-			right = base - head_w * perp
-			triangle = [tuple(tip.astype(int)), tuple(left.astype(int)), tuple(right.astype(int))]
-			draw.polygon(triangle, fill=(255, 80, 70))
-
-	return canvas
-
-
-def _detect_yolo_objects(yolo_model: Any, image_rgb: np.ndarray) -> List[str]:
-	results = yolo_model.predict(source=image_rgb, verbose=False)
-	if not results:
-		return []
-	result = results[0]
-	boxes = getattr(result, "boxes", None)
-	if boxes is None or len(boxes) == 0:
-		return []
-	names = result.names if hasattr(result, "names") else {}
-	detected_names: List[str] = []
-	for box in boxes:
-		cls_id = int(box.cls[0].item()) if getattr(box, "cls", None) is not None else -1
-		if isinstance(names, dict):
-			name = names.get(cls_id, str(cls_id))
-		elif isinstance(names, list) and 0 <= cls_id < len(names):
-			name = names[cls_id]
-		else:
-			name = str(cls_id)
-		detected_names.append(name)
-	return sorted(set(detected_names))
-
-
-def _compose_instruction(gripper_state: str, detected_objects: Optional[List[str]] = None) -> str:
-	if gripper_state == "open":
-		lines = [
-			"Infer the robotic arm's current action.",
-			"Rules: Choose the best action from: pick, place, insert, open, close. Keep it short. Do not explain.",
-			"Hint: The white bounding box represents the area where motion occurred in the past 2 seconds. Gripper state: OPEN.",
-			"Examples: `pick the object`, `open the drawer`",
-		]
-	else:
-		obj_text = ", ".join(detected_objects or []) if detected_objects else "none"
-		lines = [
-			"Infer the robotic arm's current action.",
-			"Template: <Action> <Object> [Relation] <Target>",
-			"Rules: Choose the best action from: pick, place, insert, open, close. Choose relation from: on, into, next to, from. Keep it short. Do not explain.",
-			f"Detected objects: {obj_text}",
-			"Hint: The bounding boxes outline objects. Consider object relationships. Gripper state: CLOSED.",
-			"Examples: `insert the pen into the mug`, `place the box next to the bottle`",
-		]
-	return "\n".join(lines)
 
 
 class GripperStateTracker:
@@ -231,12 +134,10 @@ def _iter_episodes(builder: Any, split: str, tfds: Any, max_episodes: int) -> It
 		yield ep_idx, episode
 
 
-
 def _load_vlm(args: argparse.Namespace):
 	from VA2L.vlm_inference import VLMInference
 	return VLMInference(
 		model=args.model,
-		model_size=args.model_size,
 		model_id=None,
 		device=args.device,
 		precision="auto",
@@ -249,7 +150,7 @@ def _load_yolo(args: argparse.Namespace):
 
 
 def _make_vlm_image_saver(args: argparse.Namespace):
-	if not args.debug:
+	if args.debug is None:
 		return None, None, None
 
 	args.vlm_input_dir.mkdir(parents=True, exist_ok=True)
@@ -295,9 +196,48 @@ def _judge_action_with_qwen(vlm: Any, pred_action: str, gt_set: List[str]) -> bo
 	return resp.startswith("correct") or resp == "yes"
 
 
+def _judge_detected_objects_with_qwen(vlm: Any, detected_objects: List[str], gt_set: List[str]) -> int:
+	"""Use Qwen to judge whether detected objects semantically match objects in the task set."""
+	if not detected_objects or not gt_set:
+		return 0
+
+	prompt = (
+		"You are evaluating object relevance for a robot task.\n"
+		f"Task descriptions: {gt_set}\n"
+		f"Detected objects: {detected_objects}\n"
+		"Question: Is at least one detected object semantically the same as an object mentioned or required in the task descriptions?\n"
+		"Reply with exactly one token: 1 or 0."
+	)
+	dummy = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8))
+	resp = vlm.infer(dummy, prompt).strip().lower()
+	return 1 if resp.startswith("1") or resp.startswith("yes") or resp.startswith("true") else 0
+
+
+def _save_debug_frame(
+	debug_dir: Path,
+	episode_index: int,
+	frame_index: int,
+	image: Image.Image,
+	wrist_image: Optional[Image.Image],
+	detected_objects: List[str],
+	pred_action: str,
+) -> None:
+	"""Save query image, wrist image, detected objects, and VLM output for a debug frame."""
+	frame_dir = debug_dir / f"ep{episode_index:04d}" / f"f{frame_index:06d}"
+	frame_dir.mkdir(parents=True, exist_ok=True)
+	image.save(frame_dir / "query.png")
+	if wrist_image is not None:
+		wrist_image.save(frame_dir / "wrist.png")
+	(frame_dir / "detected_objects.txt").write_text(
+		", ".join(detected_objects) if detected_objects else "none",
+		encoding="utf-8",
+	)
+	(frame_dir / "pred_action.txt").write_text(pred_action, encoding="utf-8")
+
+
 def annotate_csv_with_success(
 	output_csv: Path,
-	episode_gt_sets: Dict[int, List[str]],
+	episode_subtask_gt_sets: Dict[int, List[str]],
 	vlm: Any,
 ) -> Tuple[int, int, float]:
 	rows: List[Dict[str, str]] = []
@@ -315,7 +255,7 @@ def annotate_csv_with_success(
 
 			ep_idx = int(row.get("episode_index", "0"))
 			pred_action = row.get("pred_action", "")
-			ok = _judge_action_with_qwen(vlm=vlm, pred_action=pred_action, gt_set=episode_gt_sets.get(ep_idx, []))
+			ok = _judge_action_with_qwen(vlm=vlm, pred_action=pred_action, gt_set=episode_subtask_gt_sets.get(ep_idx, []))
 			row["is_correct"] = "1" if ok else "0"
 			rows.append(row)
 
@@ -333,12 +273,15 @@ def annotate_csv_with_success(
 def run_episode_online(
 	episode_index: int,
 	steps: List[Dict[str, Any]],
+	episode_subtask_gt_set: List[str],
 	image_key: str,
 	args: argparse.Namespace,
 	vlm: Any,
 	yolo_model: Any,
 	vlm_save_q: Optional[queue.Queue],
 	vlm_save_stats: Optional[Dict[str, int]],
+	debug_episode: Optional[int] = None,
+	debug_output_dir: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
 	dt = 1.0 / max(1e-6, args.playback_hz)
 	history_window = max(1, int(round(2.0 * args.playback_hz)))
@@ -348,9 +291,15 @@ def run_episode_online(
 
 	gripper_tracker = GripperStateTracker(stable_frames=args.stable_frames, stable_eps=args.stable_eps)
 	frames: List[np.ndarray] = []
+	wrist_frames: List[Optional[np.ndarray]] = []
 	for i in range(frame_count):
 		step = steps[i]
 		frames.append(_normalize_rgb(np.asarray(step["observation"][image_key])))
+		if args.wrist_key is not None:
+			wrist_value = step.get("observation", {}).get(args.wrist_key, None)
+			wrist_frames.append(_normalize_rgb(np.asarray(wrist_value)) if wrist_value is not None else None)
+		else:
+			wrist_frames.append(None)
 
 	shared = {
 		"latest": None,
@@ -392,6 +341,7 @@ def run_episode_online(
 					cond.wait()
 
 			frame = frames[frame_idx]
+			wrist_frame = wrist_frames[frame_idx]
 			step = steps[frame_idx]
 			t_infer_start = time.perf_counter()
 
@@ -402,29 +352,21 @@ def run_episode_online(
 			idx_two_sec = max(0, frame_idx - 2 * one_sec)
 			one_sec_frame = frames[idx_one_sec]
 			two_sec_frame = frames[idx_two_sec]
-
-			if gripper_state == "open":
-				rendered = _draw_motion_overlay(
-					current_rgb=frame,
-					one_sec_rgb=one_sec_frame,
-					two_sec_rgb=two_sec_frame,
-					diff_threshold=args.diff_threshold,
-					min_diff_area=args.min_diff_area,
-				)
-				det_count = 0
-				detected_objects: List[str] = []
-			else:
-					detected_objects = _detect_yolo_objects(yolo_model=yolo_model, image_rgb=frame)
-					rendered = _draw_motion_overlay(
-						current_rgb=frame,
-						one_sec_rgb=one_sec_frame,
-						two_sec_rgb=two_sec_frame,
-						diff_threshold=args.diff_threshold,
-						min_diff_area=args.min_diff_area,
-					)
-					det_count = len(detected_objects)
-
-			prompt = _compose_instruction(gripper_state, detected_objects=detected_objects)
+			prev_wrist_idx = max(0, last_consumed_idx)
+			prev_wrist_frame = wrist_frames[prev_wrist_idx]
+			rendered, prompt, stats = build_state_abstraction_frame(
+				current_rgb=frame,
+				one_sec_rgb=one_sec_frame,
+				two_sec_rgb=two_sec_frame,
+				gripper_state=gripper_state,
+				diff_threshold=args.diff_threshold,
+				min_diff_area=args.min_diff_area,
+				yolo_model=yolo_model,
+				wrist_rgb=wrist_frame,
+				prev_wrist_rgb=prev_wrist_frame,
+			)
+			detected_objects = stats.get("detected_objects", [])
+			det_count = int(stats.get("detections", 0))
 			_enqueue_vlm_image(
 				save_q=vlm_save_q,
 				stats=vlm_save_stats,
@@ -446,8 +388,21 @@ def run_episode_online(
 				"gripper_position": gripper_pos,
 				"gripper_state": gripper_state,
 				"detections": det_count,
+				"detected_objects": ", ".join(detected_objects),
+				"detected_in_task": _judge_detected_objects_with_qwen(vlm, detected_objects, episode_subtask_gt_set),
 				"pred_action": action.strip(),
 			}
+			if debug_episode is not None and episode_index == debug_episode and debug_output_dir is not None:
+				wrist_pil = Image.fromarray(wrist_frame) if wrist_frame is not None else None
+				_save_debug_frame(
+					debug_dir=debug_output_dir,
+					episode_index=episode_index,
+					frame_index=frame_idx,
+					image=rendered,
+					wrist_image=wrist_pil,
+					detected_objects=detected_objects,
+					pred_action=action.strip(),
+				)
 			last_consumed_idx = frame_idx
 
 	t_play = threading.Thread(target=playback_worker, daemon=True)
@@ -472,6 +427,8 @@ def run_episode_online(
 			"gripper_state": "",
 			"backend": "yolo",
 			"detections": "",
+			"detected_objects": "",
+			"detected_in_task": 0,
 			"pred_action": "",
 			"has_prediction": 0,
 			"history_window_frames": history_window,
@@ -502,6 +459,8 @@ def write_records(records: List[Dict[str, Any]], output_csv: Path) -> None:
 		"gripper_state",
 		"backend",
 		"detections",
+		"detected_objects",
+		"detected_in_task",
 		"pred_action",
 		"has_prediction",
 		"history_window_frames",
@@ -514,25 +473,31 @@ def write_records(records: List[Dict[str, Any]], output_csv: Path) -> None:
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="DROID-100 online benchmark (YOLO + Qwen base).")
+	parser = argparse.ArgumentParser(description="DROID-100 online benchmark (YOLO + Qwen VLM).")
 	parser.add_argument("--dataset-dir", type=Path, default=Path("dataset/droid_100/1.0.0"))
 	parser.add_argument("--split", type=str, default="train")
 	parser.add_argument("--max-episodes", type=int, default=100)
 	parser.add_argument("--max-frames", type=int, default=None)
 	parser.add_argument("--image-key", type=str, default=None)
+	parser.add_argument("--wrist-key", type=str, default=None)
 	parser.add_argument("--playback-hz", type=float, default=15.0)
 	parser.add_argument("--diff-threshold", type=int, default=24)
 	parser.add_argument("--min-diff-area", type=int, default=250)
 	parser.add_argument("--stable-frames", type=int, default=5)
 	parser.add_argument("--stable-eps", type=float, default=1e-6)
 	parser.add_argument("--yolo-model-path", type=str, default="yolov8l-worldv2.pt")
-	parser.add_argument("--model", type=str, choices=["qwen"], default="qwen")
-	parser.add_argument("--model-size", type=str, choices=["base"], default="base")
+	parser.add_argument("--model", type=str, choices=["qwen-vl-4b", "qwen-vl-2b", "qwen-35-4b"], default="qwen-vl-4b")
 	parser.add_argument("--device", type=str, default="cuda:0")
-	parser.add_argument("--debug", action="store_true", help="Asynchronously save each image sent to VLM.")
+	parser.add_argument(
+		"--debug",
+		type=int,
+		default=None,
+		help="If specified, run only this episode index and save query images, detected objects, and VLM outputs for all predicted frames.",
+	)
 	parser.add_argument("--vlm-input-dir", type=Path, default=Path("dataset/droid_100/benchmark_vlm_inputs"))
 	parser.add_argument("--vlm-save-queue-size", type=int, default=1024)
 	parser.add_argument("--evaluate", action="store_true", help="Use Qwen to judge prediction correctness and append is_correct column to CSV.")
+	parser.add_argument("--subtask-gt-path", type=Path, default=Path("dataset/droid_100/subtask_gt_set.json"))
 	parser.add_argument("--output-csv", type=Path, default=Path("dataset/droid_100/benchmark_results.csv"))
 	args = parser.parse_args()
 
@@ -545,17 +510,30 @@ def main() -> None:
 
 	vlm = _load_vlm(args)
 	yolo_model = _load_yolo(args)
+	episode_subtask_gt_sets: Dict[int, List[str]] = load_subtask_gt_sets(args.subtask_gt_path) if args.subtask_gt_path.exists() else {}
+	debug_output_dir = None
+	if args.debug is not None:
+		debug_output_dir = Path("dataset/droid_100/debug_frames")
+		debug_output_dir.mkdir(parents=True, exist_ok=True)
+		args.max_episodes = args.debug + 1
 	vlm_save_q, vlm_save_thread, vlm_save_stats = _make_vlm_image_saver(args)
 
 	all_records: List[Dict[str, Any]] = []
 	episode_gt_sets: Dict[int, List[str]] = {}
 	for ep_idx, episode in _iter_episodes(builder, args.split, tfds, max_episodes=args.max_episodes):
+		if args.debug is not None and ep_idx != args.debug:
+			continue
 		steps = _to_step_list(episode.get("steps", []))
 		if not steps:
 			continue
 		episode_gt_sets[ep_idx] = _extract_episode_gt_set(steps)
+		episode_subtask_gt_set = episode_subtask_gt_sets.get(ep_idx)
+		if episode_subtask_gt_set is None:
+			episode_subtask_gt_set = build_subtask_gt_sets({ep_idx: episode_gt_sets[ep_idx]}).get(ep_idx, episode_gt_sets[ep_idx])
+			episode_subtask_gt_sets[ep_idx] = episode_subtask_gt_set
 
 		image_key = _find_image_key(steps[0], explicit_key=args.image_key)
+		args.wrist_key = _find_wrist_key(steps[0], explicit_key=args.wrist_key)
 		history_window = max(1, int(round(2.0 * args.playback_hz)))
 		print(
 			f"[Episode {ep_idx}] steps={len(steps)}, image_key={image_key}, "
@@ -565,18 +543,24 @@ def main() -> None:
 		records = run_episode_online(
 			episode_index=ep_idx,
 			steps=steps,
+			episode_subtask_gt_set=episode_subtask_gt_set,
 			image_key=image_key,
 			args=args,
 			vlm=vlm,
 			yolo_model=yolo_model,
 			vlm_save_q=vlm_save_q,
 			vlm_save_stats=vlm_save_stats,
+			debug_episode=args.debug,
+			debug_output_dir=debug_output_dir,
 		)
 		all_records.extend(records)
 		pred_count = sum(int(r.get("has_prediction", 0)) for r in records)
 		print(f"[Episode {ep_idx}] frames={len(records)}, predictions={pred_count}, dropped={len(records) - pred_count}")
 
-	write_records(all_records, output_csv=args.output_csv)
+	if not args.subtask_gt_path.exists():
+		save_subtask_gt_sets(args.subtask_gt_path, episode_subtask_gt_sets)
+
+	save_experiment_results(all_records, output_csv=args.output_csv)
 	if vlm_save_q is not None:
 		vlm_save_q.put(None)
 	if vlm_save_thread is not None:
@@ -584,18 +568,27 @@ def main() -> None:
 
 	success_ok, success_total, success_rate = (0, 0, 0.0)
 	if args.evaluate:
-		success_ok, success_total, success_rate = annotate_csv_with_success(
+		eval_stats = evaluate_experiment_results(
 			output_csv=args.output_csv,
-			episode_gt_sets=episode_gt_sets,
+			episode_subtask_gt_sets=episode_subtask_gt_sets,
 			vlm=vlm,
+			object_col="detected_objects",
 		)
+		success_ok = int(eval_stats["task_correct"])
+		success_total = int(eval_stats["task_total"])
+		success_rate = float(eval_stats["task_rate"])
 
 	print("=== Benchmark done ===")
-	print(f"episodes: {args.max_episodes}")
+	if args.debug is not None:
+		print(f"debug_mode: episode {args.debug}")
+		print(f"debug_frames_dir: {debug_output_dir}")
+	else:
+		print(f"episodes: {args.max_episodes}")
 	print(f"records: {len(all_records)}")
-	if args.debug:
-		print(f"vlm_input_dir: {args.vlm_input_dir}")
-		print(f"vlm_input_save_dropped: {int((vlm_save_stats or {}).get('dropped', 0))}")
+	obj_judge_total = len(all_records)
+	obj_judge_hit = sum(int(r.get("detected_in_task", 0)) for r in all_records)
+	obj_judge_pct = (100.0 * obj_judge_hit / obj_judge_total) if obj_judge_total > 0 else 0.0
+	print(f"object_detect_in_task: {obj_judge_hit}/{obj_judge_total} = {obj_judge_pct:.2f}%")
 	if args.evaluate:
 		print(f"success: {success_ok}/{success_total} = {success_rate:.4f}")
 	print(f"saved_to: {args.output_csv}")

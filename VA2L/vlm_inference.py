@@ -9,44 +9,50 @@ import time
 
 
 class VLMInference:
-    """Local vision-language inference for robot task intent (Qwen or Gemma)."""
+    """Local vision-language inference for robot task intent (Qwen series)."""
 
     DEFAULT_MAX_NEW_TOKENS = 96
 
     def __init__(
         self,
-        model: str = "qwen",
-        model_size: str = "base",
+        model: str = "qwen-vl-4b",
         model_id: str = None,
         device: str = "cuda:0",
         precision: str = "auto",
     ):
         self.model = model.lower()
-        self.model_size = model_size.lower()
         self.device = device
         self.precision = precision.lower()
         self.max_new_tokens = self.DEFAULT_MAX_NEW_TOKENS
 
-        if self.model_size not in {"base", "small"}:
-            raise ValueError(f"Unknown model_size: {model_size}. Use 'base' or 'small'.")
-
         if model_id is None:
-            if self.model == "qwen" and self.model_size == "base":
+            if self.model in {"qwen", "qwen-vl", "qwen-vl-4b"}:
                 model_id = "Qwen/Qwen3-VL-4B-Instruct"
-            elif self.model == "qwen" and self.model_size == "small":
+            elif self.model == "qwen-vl-8b":
+                model_id = "Qwen/Qwen3-VL-8B-Instruct"
+            elif self.model == "qwen-vl-2b":
                 model_id = "Qwen/Qwen3-VL-2B-Instruct"
-            elif self.model == "gemma" and self.model_size == "base":
-                model_id = "google/gemma-3-4b-it"
-            elif self.model == "gemma" and self.model_size == "small":
-                model_id = "google/gemma-3-1b-it"
+            elif self.model in {"qwen-35", "qwen-35-4b"}:
+                model_id = "Qwen/Qwen3.5-4B"
             else:
-                raise ValueError(f"Unknown model: {model}. Use 'qwen' or 'gemma'.")
+                raise ValueError(
+                    f"Unknown model: {model}. Use one of: "
+                    "'qwen-vl-4b', 'qwen-vl-8b', 'qwen-vl-2b', 'qwen-35-4b'."
+                )
         
         self.model_id = model_id
-        self.is_multimodal = self.model == "qwen"
+        self.is_multimodal = self.model in {
+            "qwen",
+            "qwen-vl",
+            "qwen-vl-8b",
+            "qwen-vl-4b",
+            "qwen-vl-2b",
+            "qwen-35",
+            "qwen-35-4b",
+        }
         self.torch_dtype = self._resolve_torch_dtype()
 
-        print(f"Loading model: {model_id} (type: {self.model}, size: {self.model_size})")
+        print(f"Loading model: {model_id} (type: {self.model})")
         print(f"Precision: {self.precision} -> {self.torch_dtype}")
 
         if self.is_multimodal:
@@ -151,8 +157,7 @@ class VLMInference:
 def infer_task_intent(
     image: Image.Image,
     instruction: str,
-    model: str = "qwen",
-    model_size: str = "base",
+    model: str = "qwen-vl-4b",
     model_id: str = None,
     device: str = "cuda:0",
     precision: str = "auto",
@@ -160,7 +165,6 @@ def infer_task_intent(
     """Standalone function for single inference call."""
     vlm = VLMInference(
         model=model,
-        model_size=model_size,
         model_id=model_id,
         device=device,
         precision=precision,

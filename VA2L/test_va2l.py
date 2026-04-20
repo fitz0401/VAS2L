@@ -2,22 +2,22 @@ import argparse
 from pathlib import Path
 from PIL import Image
 
+from VA2L.state_abstraction import prepare_state_abstraction_from_demo
+
 
 def test_state_abstraction(args) -> None:
     """Test only state abstraction module: prepare and save VLM inputs."""
-    from state_abstraction import StateAbstraction
-
     print(f"\n=== Testing State Abstraction ===")
     print(f"Demo dir: {args.demo_dir}")
     print(f"Time step: {args.t}, History window: {args.k}")
 
-    abstracter = StateAbstraction(
+    image, instruction, stats = prepare_state_abstraction_from_demo(
         demo_dir=args.demo_dir,
+        t=args.t,
         window_size=args.k,
         manipulation_backend=args.backend,
         yolo_model_path=args.yolo_model_path,
     )
-    image, instruction = abstracter.prepare_vlm_inputs(args.t)
 
     out_image = Path(args.out_image)
     out_instruction = Path(args.out_instruction)
@@ -29,11 +29,12 @@ def test_state_abstraction(args) -> None:
 
     print(f"✓ Saved image: {out_image}")
     print(f"✓ Saved instruction: {out_instruction}")
+    print(f"✓ Detected objects: {', '.join(stats.get('detected_objects', [])) if stats.get('detected_objects') else 'none'}")
     print(f"\nInstruction:\n{instruction}")
 
 
 def test_vlm_inference(args) -> None:
-    """Test only VLM inference: load image/instruction and call gemma model."""
+    """Test only VLM inference: load image/instruction and call the VLM."""
     from vlm_inference import VLMInference
 
     print(f"\n=== Testing VLM Inference ===")
@@ -50,11 +51,10 @@ def test_vlm_inference(args) -> None:
     
     print(f"Loaded image: {out_image}")
     print(f"Loaded instruction from: {out_instruction}")
-    print(f"\nInitializing {args.model.upper()} {args.model_size} model...")
+    print(f"\nInitializing {args.model} model...")
     
     vlm = VLMInference(
         model=args.model,
-        model_size=args.model_size,
         model_id=None,
         device=args.device,
         precision=args.precision,
@@ -71,20 +71,18 @@ def test_vlm_inference(args) -> None:
 
 def test_full_pipeline(args) -> None:
     """Test full pipeline: state abstraction + VLM inference."""
-    from state_abstraction import StateAbstraction
-
     print(f"\n=== Testing Full VA2L Pipeline ===")
     print(f"Demo dir: {args.demo_dir}")
     print(f"Time step: {args.t}, History window: {args.k}")
     
     print(f"\nStep 1: State Abstraction")
-    abstracter = StateAbstraction(
+    image, instruction, stats = prepare_state_abstraction_from_demo(
         demo_dir=args.demo_dir,
+        t=args.t,
         window_size=args.k,
         manipulation_backend=args.backend,
         yolo_model_path=args.yolo_model_path,
     )
-    image, instruction = abstracter.prepare_vlm_inputs(args.t)
     
     out_image = Path(args.out_image)
     out_instruction = Path(args.out_instruction)
@@ -94,13 +92,13 @@ def test_full_pipeline(args) -> None:
     image.save(out_image)
     out_instruction.write_text(instruction, encoding="utf-8")
     print(f"✓ State abstraction done: {out_image}, {out_instruction}")
+    print(f"✓ Detected objects: {', '.join(stats.get('detected_objects', [])) if stats.get('detected_objects') else 'none'}")
     
     print(f"\nStep 2: VLM Inference")
     from vlm_inference import VLMInference
 
     vlm = VLMInference(
         model=args.model,
-        model_size=args.model_size,
         model_id=None,
         device=args.device,
         precision=args.precision,
@@ -153,16 +151,9 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        choices=["qwen", "gemma"],
-        default="qwen",
-        help="VLM model selection: qwen / gemma",
-    )
-    parser.add_argument(
-        "--model_size",
-        type=str,
-        choices=["base", "small"],
-        default="base",
-        help="Model size selection: base / small",
+        choices=["qwen-vl-4b", "qwen-vl-8b", "qwen-vl-2b", "qwen-35-4b"],
+        default="qwen-vl-4b",
+        help="VLM model selection: qwen-vl-4b / qwen-vl-8b / qwen-vl-2b / qwen-35-4b",
     )
     parser.add_argument(
         "--precision",

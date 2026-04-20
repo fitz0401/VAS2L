@@ -37,7 +37,6 @@ pip install transformers==4.57.0
 pip install 'accelerate>=0.26.0'
 pip install timm==0.9.12
 
-# Tips: `hf auth login` for using --model gemma
 ```
 
 ## Dataset
