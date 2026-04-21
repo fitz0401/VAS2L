@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import gc
+import base64
+import os
 import re
 import threading
 import time
@@ -13,14 +13,14 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-import torch
-from PIL import Image, ImageDraw
+from PIL import Image
 import zmq
 
 from VA2L.utils.gripper_tracker import GripperBBoxTracker, GripperDetection
 from VA2L.vlm_inference import VLMInference
 
 
+_STARTUP_SKIP_FRAMES = 20
 _IGNORED_OBJECT_TOKENS = {
     "table",
     "table top",
@@ -43,31 +43,29 @@ _IGNORED_OBJECT_TOKENS = {
 }
 
 
-def _compose_unified_prompt(object_set: List[str], visual_prompt_mode: str, gripper_track_seconds: float) -> str:
-    object_text = ", ".join(object_set) if object_set else "none"
-    if visual_prompt_mode == "gripper":
-        prompt = (
-            f"Infer the task the robotic arm is performing from the image, in which the gripper's past {gripper_track_seconds:g}-second trajectory are visible.\n"
-            "Format: <action> <target object> (<relation> <relation object>)\n"
-            "Rule 1: choose the action from pick, place, insert, open, close, move, turn.\n"
-            "Rule 2: relation and relation object are optional, relation can be on, into, from, next to.\n"
-            "Rule 3: Output one short sentence only, starting with the action. No explanation.\n"
-            "Rule 4: If the gripper is not holding an object, prioritize 'pick' action.\n"
-        )
-    else:
-        prompt = (
-            "Infer the task the robotic arm is performing from the image, in which the motion in the last 2 seconds is labeled.\n"
-            "Format: <action> <target object> (<relation> <relation object>)\n"
-            "Rule 1: choose the action from pick, place, insert, open, close, move, turn.\n"
-            "Rule 2: relation and relation object are optional, relation can be on, into, from, next to.\n"
-            "Rule 3: Output one short sentence only, starting with the action. No explanation.\n"
-            "Rule 4: If the gripper is not holding an object, prioritize 'pick' action.\n"
-            "Rule 5: The motion overlay marks the last 2 seconds of image difference.\n"
-        )
-    return prompt + f"Hint: Object set: {object_text}\n"
+def _compose_gripper_prompt(
+    gripper_track_seconds: float,
+    detected_objects: List[str],
+    possible_tasks: str = "",
+) -> str:
+    base_prompt = (
+        f"Infer the task the robotic arm is performing from the image, in which the gripper's past {gripper_track_seconds:g}-second trajectory are visible.\n"
+        "Format: <action> <target object> (<relation> <relation object>)\n"
+        "Rule 1: choose the action from pick, place, insert, open, close, move, turn.\n"
+        "Rule 2: relation and relation object are optional, relation can be on, into, from, next to.\n"
+        "Rule 3: Output one short sentence only, starting with the action. No explanation.\n"
+        "Rule 4: If the gripper is not holding an object, prioritize 'pick' action.\n"
+    )
+    if not detected_objects:
+        return base_prompt
+
+    prompt = base_prompt + f"Hint: detected tabletop objects: {', '.join(detected_objects)}.\n"
+    if possible_tasks.strip():
+        prompt += f"Hint: possible manipulation tasks by object affordance: {possible_tasks.strip()}\n"
+    return prompt
 
 
-def _normalize_object_list(text: str) -> List[str]:
+def _normalize_detected_objects(text: str) -> List[str]:
     if not text:
         return []
     cleaned = text.strip().lower()
@@ -87,61 +85,80 @@ def _normalize_object_list(text: str) -> List[str]:
     return out
 
 
-def _initialize_object_set(first_rgb: np.ndarray, vlm: VLMInference, enable_ram: bool) -> Tuple[List[str], str]:
-    first_image = Image.fromarray(first_rgb)
+def _run_online_object_detection(
+    first_rgb: np.ndarray,
+    model: str,
+    timeout_sec: float,
+) -> Tuple[List[str], str, str]:
+    from openai import OpenAI
+    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("DASHSCOPE_API_KEY is not set. Cannot run online object detection.")
 
-    if not enable_ram:
-        prompt = (
-            "List tabletop manipulable objects visible in this image.\n"
-            "Ignore table/floor/wall/background/person/robot body and gripper.\n"
-            "Output one line only: comma-separated lowercase object names. If none, output exactly: none"
-        )
-        merged_text = vlm.infer(first_image, prompt).strip()
-        return _normalize_object_list(merged_text), merged_text
+    ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(first_rgb, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise RuntimeError("Failed to encode first frame for online object detection.")
+    image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
 
-    from vision_module.recognize_anything import RAMRecognizer
-
-    ram = RAMRecognizer()
-    try:
-        raw_tags, _, _ = ram.recognize(first_image)
-    finally:
-        del ram
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-    prompt = (
-        "You are filtering object detections for tabletop robot manipulation.\n"
-        f"RAM detected tags: {raw_tags}\n"
-        "Task: merge synonyms and keep only tabletop manipulable objects visible in the image.\n"
-        "Ignore background words (table/floor/wall/room), person/human, and robot body/end-effector/gripper/arm.\n"
-        "Output format: one line comma-separated object names in lowercase. If none, output exactly: none"
+    # DashScope compatible API uses OpenAI Responses; prompt enforces tabletop-only colored object list.
+    prompt_text = (
+        "You are a tabletop object detector for robot manipulation. "
+        "Ignore robot arm/gripper/body, table, environment background, walls, floor, and room context. "
+        "Focus only on manipulable tabletop objects. "
+        "First, output one line only: comma-separated object descriptions with color, e.g., 'red mug, blue box'. "
+        "Second, output one line only describing possible tasks that the robotics arm can complete according to object affordance. "
+        "Use the format: <action> <target object> (<relation> <relation object>) . "
+        "Choose the action from pick, place, insert, open, close, move, turn. "
+        "Relation and relation object are optional; relation can be on, into, from, next to. "
+        "If no valid tabletop objects are visible, output exactly: none"
     )
-    merged_text = vlm.infer(first_image, prompt).strip()
-    normalized = _normalize_object_list(merged_text)
-    if not normalized:
-        normalized = _normalize_object_list(", ".join(raw_tags))
-    return normalized, merged_text
 
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1",
+        timeout=max(1.0, float(timeout_sec)),
+    )
 
-def _save_debug_step(
-    debug_dir: Path,
-    step_idx: int,
-    overlay: Image.Image,
-    action_text: str,
-    prompt_mode: str,
-    gripper_bbox: Optional[Tuple[int, int, int, int]] = None,
-    gripper_center: Optional[Tuple[int, int]] = None,
-) -> None:
-    step_dir = debug_dir / f"f{step_idx:06d}"
-    step_dir.mkdir(parents=True, exist_ok=True)
-    overlay.save(step_dir / "vlm_input.png")
-    (step_dir / "vlm_output.txt").write_text(action_text, encoding="utf-8")
-    (step_dir / "prompt_mode.txt").write_text(prompt_mode, encoding="utf-8")
-    if gripper_bbox is not None:
-        (step_dir / "gripper_bbox.txt").write_text(", ".join(map(str, gripper_bbox)), encoding="utf-8")
-    if gripper_center is not None:
-        (step_dir / "gripper_center.txt").write_text(", ".join(map(str, gripper_center)), encoding="utf-8")
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt_text,
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{image_b64}",
+                    },
+                ],
+            }
+        ],
+        extra_body={"enable_thinking": False},
+    )
+
+    raw_text = ""
+    for item in getattr(response, "output", []):
+        if getattr(item, "type", "") == "message":
+            content = getattr(item, "content", [])
+            if content and hasattr(content[0], "text"):
+                raw_text = str(content[0].text).strip()
+                break
+    if not raw_text:
+        raw_text = "none"
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        lines = ["none"]
+
+    detected_objects = _normalize_detected_objects(lines[0])
+    possible_tasks = ""
+    if len(lines) > 1 and detected_objects:
+        possible_tasks = " ".join(lines[1:]).strip()
+
+    return detected_objects, possible_tasks, raw_text
 
 
 def _draw_debug_caption(frame_rgb: np.ndarray, caption: str) -> np.ndarray:
@@ -193,63 +210,6 @@ def _build_debug_video_writer(debug_dir: Path, fps: float, frame_size: Tuple[int
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open debug video writer at {video_path}")
     return writer, video_path
-
-
-def _build_diff_overlay(
-    current_rgb: np.ndarray,
-    one_sec_rgb: np.ndarray,
-    two_sec_rgb: np.ndarray,
-    diff_threshold: int,
-    min_diff_area: int,
-) -> Image.Image:
-    def compute_bbox(a_rgb: np.ndarray, b_rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-        diff = cv2.absdiff(a_rgb, b_rgb)
-        gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
-        _, binary = cv2.threshold(gray, diff_threshold, 255, cv2.THRESH_BINARY)
-        binary = cv2.medianBlur(binary, 5)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-        best = max(contours, key=cv2.contourArea)
-        if float(cv2.contourArea(best)) < float(min_diff_area):
-            return None
-        x, y, w, h = cv2.boundingRect(best)
-        return x, y, x + w, y + h
-
-    def bbox_center(bbox: Optional[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int]]:
-        if bbox is None:
-            return None
-        x1, y1, x2, y2 = bbox
-        return int(round((x1 + x2) / 2.0)), int(round((y1 + y2) / 2.0))
-
-    canvas = Image.fromarray(current_rgb.copy())
-    draw = ImageDraw.Draw(canvas)
-    cur_bbox = compute_bbox(current_rgb, one_sec_rgb)
-    prev_bbox = compute_bbox(one_sec_rgb, two_sec_rgb)
-    start_pt = bbox_center(prev_bbox)
-    end_pt = bbox_center(cur_bbox)
-
-    if cur_bbox is not None:
-        draw.rectangle(cur_bbox, outline=(255, 255, 255), width=3)
-
-    if start_pt is not None and end_pt is not None:
-        draw.line([start_pt, end_pt], fill=(255, 80, 70), width=4)
-        dx = end_pt[0] - start_pt[0]
-        dy = end_pt[1] - start_pt[1]
-        norm = float(np.hypot(dx, dy))
-        if norm > 1e-6:
-            ux, uy = dx / norm, dy / norm
-            head_len = 12.0
-            head_w = 7.0
-            tip = np.array([end_pt[0], end_pt[1]], dtype=np.float64)
-            base = tip - head_len * np.array([ux, uy], dtype=np.float64)
-            perp = np.array([-uy, ux], dtype=np.float64)
-            left = base + head_w * perp
-            right = base - head_w * perp
-            triangle = [tuple(tip.astype(int)), tuple(left.astype(int)), tuple(right.astype(int))]
-            draw.polygon(triangle, fill=(255, 80, 70))
-
-    return canvas
 
 
 def _build_gripper_overlay(
@@ -321,7 +281,7 @@ def _start_intent_server(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Real-world intent detection with diff/gripper visual prompting.")
+    parser = argparse.ArgumentParser(description="Real-world intent detection with gripper visual prompting.")
     parser.add_argument("--device-id", type=str, default="f1421698")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -329,17 +289,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default="qwen-vl-4b")
     parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--precision", type=str, default="auto")
-    parser.add_argument("--enable-ram", action="store_true", help="Enable RAM-assisted object-set initialization.")
-    parser.add_argument("--visual-prompt-mode", type=str, choices=["diff", "gripper"], default="diff")
     parser.add_argument("--gripper-model-path", type=Path, default=Path("ckpts/yolo_best.pt"))
     parser.add_argument("--gripper-conf-threshold", type=float, default=0.25)
     parser.add_argument("--gripper-iou-threshold", type=float, default=0.45)
-    parser.add_argument("--gripper-track-seconds", type=float, default=1.0, help="History window used in gripper visual prompt mode.")
-    parser.add_argument("--diff-threshold", type=int, default=24)
-    parser.add_argument("--min-diff-area", type=int, default=250)
+    parser.add_argument("--gripper-track-seconds", type=float, default=2.0, help="History window used in gripper tracking.")
+    parser.add_argument("--enable-online-vlm", action="store_true", help="Enable one-time online VLM object detection after startup skip.")
+    parser.add_argument("--online-object-model", type=str, default="qwen3.5-plus", help="Online VLM model name for first-frame object detection.")
+    parser.add_argument("--online-object-save-path", type=Path, default=Path("dataset/realworld/debug_intent/online_detected_objects.txt"), help="Path to save online detected objects raw output.")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--debug-dir", type=Path, default=Path("dataset/realworld/debug_intent"))
-    parser.add_argument("--output", "--ouput", action="store_true", dest="output", help="If set, print per-frame predicted action.")
+    parser.add_argument("--output", action="store_true", dest="output", help="If set, print per-frame predicted action.")
     parser.add_argument("--server-host", type=str, default="*", help="ZMQ bind host, e.g. * or 127.0.0.1")
     parser.add_argument("--server-port", type=int, default=5562, help="ZMQ REP server port")
     return parser
@@ -361,17 +320,14 @@ def main() -> None:
         device=args.device,
         precision=args.precision,
     )
-    print(f"Visual prompt mode: {args.visual_prompt_mode}")
-    print(f"Object init mode: {'RAM+VLM' if args.enable_ram else 'VLM-only'}")
+    print("Visual prompt mode: gripper")
 
-    gripper_tracker: Optional[GripperBBoxTracker] = None
-    if args.visual_prompt_mode == "gripper":
-        gripper_tracker = GripperBBoxTracker(
-            model_path=args.gripper_model_path,
-            conf_threshold=args.gripper_conf_threshold,
-            iou_threshold=args.gripper_iou_threshold,
-        )
-        print(f"Gripper tracker model: {gripper_tracker.model_path}")
+    gripper_tracker = GripperBBoxTracker(
+        model_path=args.gripper_model_path,
+        conf_threshold=args.gripper_conf_threshold,
+        iou_threshold=args.gripper_iou_threshold,
+    )
+    print(f"Gripper tracker model: {gripper_tracker.model_path}")
 
     latest_state: Dict[str, Any] = {
         "has_action": False,
@@ -379,7 +335,7 @@ def main() -> None:
         "frame_index": -1,
         "ts": 0.0,
         "object_set": [],
-        "visual_prompt_mode": args.visual_prompt_mode,
+        "visual_prompt_mode": "gripper",
         "gripper_center": None,
     }
     state_lock = threading.Lock()
@@ -396,40 +352,19 @@ def main() -> None:
     if args.debug:
         args.debug_dir.mkdir(parents=True, exist_ok=True)
 
-    frame_history: Deque[np.ndarray] = deque(maxlen=max(2 * args.fps + 2, 4))
     gripper_history: Deque[Tuple[float, Tuple[int, int]]] = deque()
-    debug_writer = None
-    debug_video_path = None
-    if args.debug:
-        debug_writer, debug_video_path = None, None
+    debug_writer: Optional[cv2.VideoWriter] = None
+    debug_video_path: Optional[Path] = None
 
     print("Starting camera stream...")
     pipeline.start(config)
 
-    object_set: List[str] = []
     frame_idx = 0
-    debug_writer = None
+    detected_objects: List[str] = []
+    possible_tasks = ""
+    prompt = _compose_gripper_prompt(args.gripper_track_seconds, detected_objects, possible_tasks)
+    online_detection_done = not bool(args.enable_online_vlm)
     try:
-        while True:
-            frameset = pipeline.wait_for_frames()
-            color_frame = frameset.get_color_frame()
-            if not color_frame:
-                continue
-            bgr = np.asanyarray(color_frame.get_data())
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            object_set, init_raw = _initialize_object_set(rgb, vlm, enable_ram=args.enable_ram)
-            print(f"[Init] object_set={object_set}")
-            if args.debug:
-                (args.debug_dir / "object_set.txt").write_text(
-                    ", ".join(object_set) if object_set else "none",
-                    encoding="utf-8",
-                )
-                (args.debug_dir / "object_init_raw.txt").write_text(init_raw, encoding="utf-8")
-                Image.fromarray(rgb).save(args.debug_dir / "init_frame.png")
-            frame_history.append(rgb)
-            break
-
-        prompt = _compose_unified_prompt(object_set, args.visual_prompt_mode, args.gripper_track_seconds)
         print("Enter online inference loop. Press Ctrl+C to stop.")
 
         if args.debug:
@@ -444,63 +379,79 @@ def main() -> None:
 
             bgr = np.asanyarray(color_frame.get_data())
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            frame_history.append(rgb)
             now_ts = time.time()
 
-            if len(frame_history) < 3:
+            if frame_idx < _STARTUP_SKIP_FRAMES:
+                frame_idx += 1
                 continue
 
-            one_sec_back = min(len(frame_history) - 1, max(1, args.fps))
-            two_sec_back = min(len(frame_history) - 1, max(1, 2 * args.fps))
-            current_rgb = frame_history[-1]
+            if not online_detection_done:
+                args.debug_dir.mkdir(parents=True, exist_ok=True)
+                init_frame_path = args.debug_dir / "init_frame.png"
+                Image.fromarray(rgb).save(init_frame_path)
 
-            if args.visual_prompt_mode == "diff":
-                one_sec_rgb = frame_history[-1 - one_sec_back]
-                two_sec_rgb = frame_history[-1 - two_sec_back]
-                overlay = _build_diff_overlay(
-                    current_rgb=current_rgb,
-                    one_sec_rgb=one_sec_rgb,
-                    two_sec_rgb=two_sec_rgb,
-                    diff_threshold=args.diff_threshold,
-                    min_diff_area=args.min_diff_area,
+                t_start = time.perf_counter()
+                detected_objects, possible_tasks, raw_detected_text = _run_online_object_detection(
+                    first_rgb=rgb,
+                    model=args.online_object_model,
+                    timeout_sec=20.0,
                 )
+
+                elapsed = time.perf_counter() - t_start
+                print(f"[online vlm object detection] elapsed={elapsed:.3f}s")
+                print(f"[Detected objects] {detected_objects if detected_objects else ['none']}")
+                print(f"Saved init frame to: {init_frame_path}")
+                if possible_tasks:
+                    print(f"[Possible tasks] {possible_tasks}")
+
+                args.online_object_save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_lines = [
+                    f"objects_raw: {raw_detected_text}",
+                    f"objects_norm: {', '.join(detected_objects) if detected_objects else 'none'}",
+                ]
+                save_lines.append(f"possible_tasks: {possible_tasks if possible_tasks else 'none'}")
+                args.online_object_save_path.write_text("\n".join(save_lines) + "\n", encoding="utf-8")
+                print(f"Saved object metadata to: {args.online_object_save_path}")
+
+                prompt = _compose_gripper_prompt(
+                    args.gripper_track_seconds,
+                    detected_objects,
+                    possible_tasks,
+                )
+                online_detection_done = True
+
+            detection = gripper_tracker.detect(rgb)
+            if detection is not None:
+                gripper_history.append((now_ts, detection.center))
+                gripper_bbox = detection.bbox
+                gripper_center = detection.center
+            else:
                 gripper_bbox = None
                 gripper_center = None
-            else:
-                assert gripper_tracker is not None
-                detection = gripper_tracker.detect(current_rgb)
-                if detection is not None:
-                    gripper_history.append((now_ts, detection.center))
-                    gripper_bbox = detection.bbox
-                    gripper_center = detection.center
-                else:
-                    gripper_bbox = None
-                    gripper_center = None
-                cutoff = now_ts - max(0.0, float(args.gripper_track_seconds))
-                while gripper_history and gripper_history[0][0] < cutoff:
-                    gripper_history.popleft()
-                overlay = _build_gripper_overlay(
-                    current_rgb=current_rgb,
-                    tracker=gripper_tracker,
-                    history_centers=[center for _, center in gripper_history],
-                    detection=detection,
-                )
+
+            cutoff = now_ts - max(0.0, float(args.gripper_track_seconds))
+            while gripper_history and gripper_history[0][0] < cutoff:
+                gripper_history.popleft()
+
+            overlay = _build_gripper_overlay(
+                current_rgb=rgb,
+                tracker=gripper_tracker,
+                history_centers=[center for _, center in gripper_history],
+                detection=detection,
+            )
 
             action = vlm.infer(overlay, prompt).strip()
-            debug_frame_rgb = None
             if args.debug:
                 caption_lines = [
                     f"frame={frame_idx:06d}",
-                    f"mode={args.visual_prompt_mode}",
+                    "mode=gripper",
                     f"action={action if action else 'none'}",
                 ]
-                if args.visual_prompt_mode == "gripper":
-                    bbox_text = "none" if gripper_bbox is None else f"({gripper_bbox[0]}, {gripper_bbox[1]}, {gripper_bbox[2]}, {gripper_bbox[3]})"
-                    center_text = "none" if gripper_center is None else f"({gripper_center[0]}, {gripper_center[1]})"
-                    caption_lines.append(f"bbox={bbox_text}")
-                    caption_lines.append(f"center={center_text}")
-                else:
-                    caption_lines.append(f"objects={', '.join(object_set) if object_set else 'none'}")
+                caption_lines.append(f"objects={', '.join(detected_objects) if detected_objects else 'none'}")
+                bbox_text = "none" if gripper_bbox is None else f"({gripper_bbox[0]}, {gripper_bbox[1]}, {gripper_bbox[2]}, {gripper_bbox[3]})"
+                center_text = "none" if gripper_center is None else f"({gripper_center[0]}, {gripper_center[1]})"
+                caption_lines.append(f"bbox={bbox_text}")
+                caption_lines.append(f"center={center_text}")
                 debug_frame_rgb = _draw_debug_caption(np.asarray(overlay), "\n".join(caption_lines))
                 if debug_writer is not None:
                     debug_writer.write(cv2.cvtColor(debug_frame_rgb, cv2.COLOR_RGB2BGR))
@@ -512,16 +463,13 @@ def main() -> None:
                     latest_state["action"] = action
                     latest_state["frame_index"] = frame_idx
                     latest_state["ts"] = float(ts)
-                    latest_state["object_set"] = list(object_set)
-                    latest_state["visual_prompt_mode"] = args.visual_prompt_mode
+                    latest_state["object_set"] = []
+                    latest_state["visual_prompt_mode"] = "gripper"
                     latest_state["gripper_center"] = gripper_center
 
                 if args.output:
-                    if args.visual_prompt_mode == "gripper":
-                        center_text = "none" if gripper_center is None else f"({gripper_center[0]}, {gripper_center[1]})"
-                        print(f"[{frame_idx:06d}] center={center_text} action={action}")
-                    else:
-                        print(f"[{frame_idx:06d}] action={action}")
+                    center_text = "none" if gripper_center is None else f"({gripper_center[0]}, {gripper_center[1]})"
+                    print(f"[{frame_idx:06d}] center={center_text} action={action}")
 
             frame_idx += 1
 
