@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import re
 import threading
@@ -16,6 +17,7 @@ import pyrealsense2 as rs
 from PIL import Image
 import zmq
 
+from VA2L.lang_rephrase import rephrase_instruction
 from VA2L.utils.gripper_tracker import GripperBBoxTracker, GripperDetection
 from VA2L.vlm_inference import VLMInference
 
@@ -83,6 +85,11 @@ def _normalize_detected_objects(text: str) -> List[str]:
             seen.add(token)
             out.append(token)
     return out
+
+
+def _refine_action(vlm: VLMInference, action: str) -> str:
+    refined = rephrase_instruction(action, vlm=vlm)
+    return refined.strip() if refined else action.strip()
 
 
 def _run_online_object_detection(
@@ -227,6 +234,7 @@ def _start_intent_server(
     latest_state: Dict[str, Any],
     state_lock: threading.Lock,
     stop_event: threading.Event,
+    vlm: VLMInference,
 ) -> Tuple[threading.Thread, Any, Any]:
     ctx = zmq.Context.instance()
     socket = ctx.socket(zmq.REP)
@@ -243,11 +251,26 @@ def _start_intent_server(
                 continue
 
             try:
-                req = socket.recv_string()
+                req = socket.recv_multipart()
             except Exception:
                 continue
 
-            cmd = req.strip().lower()
+            cmd = ""
+            payload: Dict[str, Any] = {}
+            if len(req) == 1:
+                raw_req = req[0].decode("utf-8", errors="ignore").strip()
+                try:
+                    payload = json.loads(raw_req)
+                    cmd = str(payload.get("command", "")).strip().lower()
+                except Exception:
+                    cmd = raw_req.strip().lower()
+            elif len(req) >= 2:
+                cmd = req[0].decode("utf-8", errors="ignore").strip().lower()
+                try:
+                    payload = json.loads(req[1].decode("utf-8", errors="ignore"))
+                except Exception:
+                    payload = {}
+
             if cmd == "get_intent":
                 with state_lock:
                     has_action = bool(latest_state.get("has_action", False))
@@ -266,6 +289,14 @@ def _start_intent_server(
                     )
                 else:
                     socket.send_json({"ok": False, "message": "no cached intent yet"})
+            elif cmd == "refine_instruction":
+                instruction = str(payload.get("instruction", "")).strip()
+                if not instruction:
+                    socket.send_json({"ok": False, "message": "instruction is required"})
+                    continue
+
+                refined = _refine_action(vlm, instruction)
+                socket.send_json({"ok": True, "instruction": refined})
             else:
                 socket.send_json(
                     {
@@ -289,6 +320,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default="qwen-vl-4b")
     parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--precision", type=str, default="auto")
+    parser.add_argument("--enable_refine", action="store_true", help="Refine each predicted intent with lang rephrase.")
     parser.add_argument("--gripper-model-path", type=Path, default=Path("ckpts/yolo_best.pt"))
     parser.add_argument("--gripper-conf-threshold", type=float, default=0.25)
     parser.add_argument("--gripper-iou-threshold", type=float, default=0.45)
@@ -346,6 +378,7 @@ def main() -> None:
         latest_state=latest_state,
         state_lock=state_lock,
         stop_event=stop_event,
+        vlm=vlm,
     )
     print(f"Intent server started at tcp://{args.server_host}:{args.server_port}")
 
@@ -441,6 +474,8 @@ def main() -> None:
             )
 
             action = vlm.infer(overlay, prompt).strip()
+            if args.enable_refine and action:
+                action = _refine_action(vlm, action)
             if args.debug:
                 caption_lines = [
                     f"frame={frame_idx:06d}",

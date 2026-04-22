@@ -151,9 +151,9 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        choices=["qwen-vl-4b", "qwen-vl-8b", "qwen-vl-2b", "qwen-35-4b"],
+        choices=["qwen-vl-4b", "qwen-vl-8b", "qwen-vl-2b"],
         default="qwen-vl-4b",
-        help="VLM model selection: qwen-vl-4b / qwen-vl-8b / qwen-vl-2b / qwen-35-4b",
+        help="VLM model selection: qwen-vl-4b / qwen-vl-8b / qwen-vl-2b",
     )
     parser.add_argument(
         "--precision",

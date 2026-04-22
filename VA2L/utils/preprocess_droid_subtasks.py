@@ -140,7 +140,7 @@ def main() -> None:
 	parser.add_argument("--max-episodes", type=int, default=100)
 	parser.add_argument("--output", type=Path, default=Path("dataset/droid_100/subtask_gt_set.json"))
 	parser.add_argument("--device", type=str, default="cuda:0")
-	parser.add_argument("--model", type=str, choices=["qwen-vl-4b", "qwen-vl-2b", "qwen-35-4b"], default="qwen-vl-4b")
+	parser.add_argument("--model", type=str, choices=["qwen-vl-4b", "qwen-vl-2b"], default="qwen-vl-4b")
 	parser.add_argument("--precision", type=str, choices=["auto", "fp16", "bf16", "fp32"], default="auto")
 	parser.add_argument("--fallback-rule-only", action="store_true", help="Skip Qwen and use rule-based splitting only.")
 	args = parser.parse_args()

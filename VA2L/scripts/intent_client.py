@@ -9,7 +9,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5562)
     parser.add_argument("--timeout-ms", type=int, default=3000)
-    parser.add_argument("--command", type=str, default="get_intent", help="Server command, e.g. get_intent")
+    parser.add_argument(
+        "--command",
+        type=str,
+        default="get_intent",
+        choices=["get_intent", "refine_instruction"],
+        help="Server command.",
+    )
+    parser.add_argument("--instruction", type=str, default="", help="Instruction to refine.")
     return parser
 
 
@@ -30,7 +37,11 @@ def main() -> None:
     sock.connect(endpoint)
 
     try:
-        sock.send_string(args.command)
+        if args.command == "refine_instruction":
+            payload = {"command": args.command, "instruction": args.instruction.strip()}
+            sock.send_multipart([args.command.encode("utf-8"), json.dumps(payload, ensure_ascii=False).encode("utf-8")])
+        else:
+            sock.send_string(args.command)
         reply = sock.recv_json()
         print(json.dumps(reply, ensure_ascii=False))
     finally:

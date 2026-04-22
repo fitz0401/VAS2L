@@ -2,14 +2,14 @@ import os
 # This pipeline uses PyTorch-only inference; avoid importing TensorFlow backends.
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("USE_TF", "0")
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from PIL import Image
 import torch
 import time
 
 
 class VLMInference:
-    """Local vision-language inference for robot task intent (Qwen series)."""
+    """Local vision-language inference for robot task intent (Qwen-VL series)."""
 
     DEFAULT_MAX_NEW_TOKENS = 96
 
@@ -32,43 +32,24 @@ class VLMInference:
                 model_id = "Qwen/Qwen3-VL-8B-Instruct"
             elif self.model == "qwen-vl-2b":
                 model_id = "Qwen/Qwen3-VL-2B-Instruct"
-            elif self.model in {"qwen-35", "qwen-35-4b"}:
-                model_id = "Qwen/Qwen3.5-4B"
             else:
                 raise ValueError(
                     f"Unknown model: {model}. Use one of: "
-                    "'qwen-vl-4b', 'qwen-vl-8b', 'qwen-vl-2b', 'qwen-35-4b'."
+                    "'qwen-vl-4b', 'qwen-vl-8b', 'qwen-vl-2b'."
                 )
         
         self.model_id = model_id
-        self.is_multimodal = self.model in {
-            "qwen",
-            "qwen-vl",
-            "qwen-vl-8b",
-            "qwen-vl-4b",
-            "qwen-vl-2b",
-            "qwen-35",
-            "qwen-35-4b",
-        }
         self.torch_dtype = self._resolve_torch_dtype()
 
         print(f"Loading model: {model_id} (type: {self.model})")
         print(f"Precision: {self.precision} -> {self.torch_dtype}")
 
-        if self.is_multimodal:
-            self.model_obj = AutoModelForImageTextToText.from_pretrained(
-                model_id,
-                device_map={"": device},
-                dtype=self.torch_dtype,
-            ).eval()
-            self.processor = AutoProcessor.from_pretrained(model_id)
-        else:
-            self.model_obj = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map={"": device},
-                dtype=self.torch_dtype,
-            ).eval()
-            self.processor = AutoTokenizer.from_pretrained(model_id)
+        self.model_obj = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            device_map={"": device},
+            dtype=self.torch_dtype,
+        ).eval()
+        self.processor = AutoProcessor.from_pretrained(model_id)
 
         first_param_device = next(self.model_obj.parameters()).device
         print(f"Model loaded successfully on device: {first_param_device}")
@@ -99,39 +80,23 @@ class VLMInference:
         """
         concise_instruction = instruction.strip() + "\n\nPlease answer in one short sentence only. No bullets."
 
-        if self.is_multimodal:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": concise_instruction},
-                    ],
-                },
-            ]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": concise_instruction},
+                ],
+            },
+        ]
 
-            inputs = self.processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            ).to(self.model_obj.device)
-        else:
-            messages = [
-                {
-                    "role": "user",
-                    "content": concise_instruction,
-                },
-            ]
-
-            inputs = self.processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            ).to(self.model_obj.device)
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model_obj.device)
 
         input_len = inputs["input_ids"].shape[-1]
 
@@ -152,6 +117,42 @@ class VLMInference:
         result = self.processor.decode(generation, skip_special_tokens=True)
         # print(f"VLM inference time: {elapsed:.3f} s")
         return result
+
+    def infer_text(self, instruction: str) -> str:
+        """Generate a text-only response from an instruction prompt."""
+        prompt = instruction.strip()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model_obj.device)
+
+        input_len = inputs["input_ids"].shape[-1]
+
+        with torch.inference_mode():
+            generation = self.model_obj.generate(
+                **inputs, max_new_tokens=self.max_new_tokens, do_sample=False
+            )
+            generation = generation[0][input_len:]
+
+        if generation.shape[-1] >= self.max_new_tokens:
+            print(
+                f"Warning: output reached max_new_tokens={self.max_new_tokens}. "
+                "The result may be truncated. Increase VLMInference.DEFAULT_MAX_NEW_TOKENS for longer answers."
+            )
+
+        return self.processor.decode(generation, skip_special_tokens=True)
 
 
 def infer_task_intent(

@@ -486,7 +486,7 @@ def main() -> None:
 	parser.add_argument("--stable-frames", type=int, default=5)
 	parser.add_argument("--stable-eps", type=float, default=1e-6)
 	parser.add_argument("--yolo-model-path", type=str, default="yolov8l-worldv2.pt")
-	parser.add_argument("--model", type=str, choices=["qwen-vl-4b", "qwen-vl-2b", "qwen-35-4b"], default="qwen-vl-4b")
+	parser.add_argument("--model", type=str, choices=["qwen-vl-4b", "qwen-vl-2b"], default="qwen-vl-4b")
 	parser.add_argument("--device", type=str, default="cuda:0")
 	parser.add_argument(
 		"--debug",
