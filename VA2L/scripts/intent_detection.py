@@ -17,7 +17,6 @@ import pyrealsense2 as rs
 from PIL import Image
 import zmq
 
-from VA2L.lang_rephrase import rephrase_instruction
 from VA2L.utils.gripper_tracker import GripperBBoxTracker, GripperDetection
 from VA2L.vlm_inference import VLMInference
 
@@ -52,11 +51,19 @@ def _compose_gripper_prompt(
 ) -> str:
     base_prompt = (
         f"Infer the task the robotic arm is performing from the image, in which the gripper's past {gripper_track_seconds:g}-second trajectory are visible.\n"
-        "Format: <action> <target object> (<relation> <relation object>)\n"
         "Rule 1: choose the action from pick, place, insert, open, close, move, turn.\n"
-        "Rule 2: relation and relation object are optional, relation can be on, into, from, next to.\n"
+        "Rule 2: relation (on, into, from, next to) and relative object are optional.\n"
         "Rule 3: Output one short sentence only, starting with the action. No explanation.\n"
-        "Rule 4: If the gripper is not holding an object, prioritize 'pick' action.\n"
+        "Rule 4: If the gripper is not holding an object, prioritize 'pick' and 'open' action.\n"
+        "Examples:\n"
+        "-Put [Object] in/on/into [Target] \n"
+        "-Pick up [Object] from [Source]\n"
+        "-Move [Object] [Direction/Relative Position]\n"
+        "-Open/Close [Articulated Object like drawer/cabinet/lid]\n"
+        "-Wipe [Target] with [Tool]\n"
+        "-Pour [Content] from [Source] into [Target]\n"
+        "-Fold/Unfold [Deformable Object like towel/cloth]\n"
+        "-Turn on/off [Switch/Appliance]\n"
     )
     if not detected_objects:
         return base_prompt
@@ -85,11 +92,6 @@ def _normalize_detected_objects(text: str) -> List[str]:
             seen.add(token)
             out.append(token)
     return out
-
-
-def _refine_action(vlm: VLMInference, action: str) -> str:
-    refined = rephrase_instruction(action, vlm=vlm)
-    return refined.strip() if refined else action.strip()
 
 
 def _run_online_object_detection(
@@ -228,19 +230,55 @@ def _build_gripper_overlay(
     return Image.fromarray(tracker.draw_overlay(current_rgb, detection, history_centers, show_text=False))
 
 
+def _build_intent_prompt(
+    gripper_track_seconds: float,
+    detected_objects: List[str],
+    possible_tasks: str = "",
+    instruction: str = "",
+) -> str:
+    prompt = _compose_gripper_prompt(gripper_track_seconds, detected_objects, possible_tasks)
+    cleaned_instruction = instruction.strip()
+    if cleaned_instruction:
+        prompt += f"Hint: user instruction: {cleaned_instruction}\n"
+        prompt += (
+            "Rule 5: If user instruction aligns with the examples, refine it with image evidence, especially adding colors for the objects.\n"
+            "Rule 6: If grounded objects are mentioned in the instruction, refine the verb in the instruction from the examples.\n"
+            "Rule 7: If no grounded object and verb are mentioned, output: none\n"
+        )
+    return prompt
+
+
 def _start_intent_server(
     bind_host: str,
     port: int,
     latest_state: Dict[str, Any],
     state_lock: threading.Lock,
     stop_event: threading.Event,
-    vlm: VLMInference,
 ) -> Tuple[threading.Thread, Any, Any]:
     ctx = zmq.Context.instance()
     socket = ctx.socket(zmq.REP)
     socket.linger = 0
     endpoint = f"tcp://{bind_host}:{port}"
     socket.bind(endpoint)
+
+    def _send_cached_action() -> None:
+        with state_lock:
+            has_action = bool(latest_state.get("has_action", False))
+            cached = dict(latest_state)
+        if has_action:
+            socket.send_json(
+                {
+                    "ok": True,
+                    "action": cached.get("action", ""),
+                    "frame_index": cached.get("frame_index", -1),
+                    "ts": cached.get("ts", 0.0),
+                    "object_set": cached.get("object_set", []),
+                    "visual_prompt_mode": cached.get("visual_prompt_mode", "diff"),
+                    "gripper_center": cached.get("gripper_center", None),
+                }
+            )
+        else:
+            socket.send_json({"ok": False, "message": "no cached intent yet"})
 
     def _server_loop() -> None:
         poller = zmq.Poller()
@@ -273,36 +311,27 @@ def _start_intent_server(
 
             if cmd == "get_intent":
                 with state_lock:
-                    has_action = bool(latest_state.get("has_action", False))
-                    cached = dict(latest_state)
-                if has_action:
-                    socket.send_json(
-                        {
-                            "ok": True,
-                            "action": cached.get("action", ""),
-                            "frame_index": cached.get("frame_index", -1),
-                            "ts": cached.get("ts", 0.0),
-                            "object_set": cached.get("object_set", []),
-                            "visual_prompt_mode": cached.get("visual_prompt_mode", "diff"),
-                            "gripper_center": cached.get("gripper_center", None),
-                        }
-                    )
-                else:
-                    socket.send_json({"ok": False, "message": "no cached intent yet"})
+                    # Clear cached refine instruction only when a get_intent request is served.
+                    latest_state["instruction"] = ""
+                _send_cached_action()
             elif cmd == "refine_instruction":
                 instruction = str(payload.get("instruction", "")).strip()
                 if not instruction:
                     socket.send_json({"ok": False, "message": "instruction is required"})
                     continue
 
-                refined = _refine_action(vlm, instruction)
-                socket.send_json({"ok": True, "instruction": refined})
+                with state_lock:
+                    latest_state["instruction_revision"] = int(latest_state.get("instruction_revision", 0)) + 1
+                    latest_state["instruction"] = instruction
+                    latest_state["instruction_ts"] = time.time()
+
+                _send_cached_action()
             else:
                 socket.send_json(
                     {
                         "ok": False,
                         "message": f"unknown command: {req}",
-                        "supported": ["get_intent"],
+                        "supported": ["get_intent", "refine_instruction"],
                     }
                 )
 
@@ -320,7 +349,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default="qwen-vl-4b")
     parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--precision", type=str, default="auto")
-    parser.add_argument("--enable_refine", action="store_true", help="Refine each predicted intent with lang rephrase.")
     parser.add_argument("--gripper-model-path", type=Path, default=Path("ckpts/yolo_best.pt"))
     parser.add_argument("--gripper-conf-threshold", type=float, default=0.25)
     parser.add_argument("--gripper-iou-threshold", type=float, default=0.45)
@@ -369,6 +397,9 @@ def main() -> None:
         "object_set": [],
         "visual_prompt_mode": "gripper",
         "gripper_center": None,
+        "instruction": "",
+        "instruction_ts": 0.0,
+        "instruction_revision": 0,
     }
     state_lock = threading.Lock()
     stop_event = threading.Event()
@@ -378,7 +409,6 @@ def main() -> None:
         latest_state=latest_state,
         state_lock=state_lock,
         stop_event=stop_event,
-        vlm=vlm,
     )
     print(f"Intent server started at tcp://{args.server_host}:{args.server_port}")
 
@@ -395,8 +425,8 @@ def main() -> None:
     frame_idx = 0
     detected_objects: List[str] = []
     possible_tasks = ""
-    prompt = _compose_gripper_prompt(args.gripper_track_seconds, detected_objects, possible_tasks)
     online_detection_done = not bool(args.enable_online_vlm)
+    last_reported_instruction_revision = 0
     try:
         print("Enter online inference loop. Press Ctrl+C to stop.")
 
@@ -473,9 +503,20 @@ def main() -> None:
                 detection=detection,
             )
 
+            with state_lock:
+                instruction = str(latest_state.get("instruction", "")).strip()
+                instruction_revision = int(latest_state.get("instruction_revision", 0))
+
+            prompt = _build_intent_prompt(
+                args.gripper_track_seconds,
+                detected_objects,
+                possible_tasks,
+                instruction=instruction,
+            )
             action = vlm.infer(overlay, prompt).strip()
-            if args.enable_refine and action:
-                action = _refine_action(vlm, action)
+            if instruction and instruction_revision != last_reported_instruction_revision:
+                print(f"[refine result] original instruction={instruction or 'none'}; predicted action={action or 'none'}")
+                last_reported_instruction_revision = instruction_revision
             if args.debug:
                 caption_lines = [
                     f"frame={frame_idx:06d}",

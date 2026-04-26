@@ -10,10 +10,10 @@ _REPHRASE_PROMPT = """Your goal is to convert user input into the specific style
 
 ### Rules:
 1. Task Validation: If the user's instruction is NOT related to physical robot manipulation (e.g., general questions, chat, math, code, or abstract requests), output exactly: "[NOT_A_MANIPULATION_TASK]".
-2. Imperative Style: Use direct, short, natural commands. Remove all politeness (please, can you, etc.).
-3. Core Structure: Prioritize the template: [Verb] + [Object with descriptors] + [Spatial Relation] + [Target/Location].
+2. Imperative Style: Remove all politeness (please, can you, etc.).
+3. Avoid Making Up New Elements: Do not make up new objects, relations, or actions that are not in the original instruction.
 4. Preserve Grounding Details: Keep essential visual adjectives (color, material, texture) if provided (e.g., "the red bowl" should not become just "the bowl").
-5. Strict Patterns: Follow the dataset patterns listed below. If the instruction doesn't fit, rephrase it to the closest pattern.
+5. Strict Patterns: Fit the instruction into the dataset patterns. Prioritize the template: [Verb] + [Object with descriptors] + [Spatial Relation] + [Target/Location].
 
 ### Dataset Patterns:
 - Put [Object] in/on/into [Target]
