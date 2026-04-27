@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import os
 import re
 import sys
-import time
 from typing import List, Optional
 from VA2L.vlm_inference import VLMInference
 
@@ -24,9 +21,10 @@ TEMPLATES = [
 DEFAULT_DETECTED_OBJECTS = [
     "green grape",
     "white drawer",
-    "yellow cup",
-    "red mug",
+    "yellow teacup",
+    "blue cup",
     "marker pen",
+    "red apple"
 ]
 
 
@@ -47,8 +45,8 @@ You MUST select exactly one template ID from this list:
 6: fold the {object}
 
 Selection hint:
-- Objects in same category are allowed (e.g. pen -> marker).
-- Use semantic similarity between instruction and templates.
+- Consider spelling and phonetic similarity for object names (e.g. jar -> drawer, cup -> cap, grip -> grape, gray -> grape, door -> drawer).
+- Use semantic similarity between instruction and templates (e.g. pen -> marker, grasp -> pick).
 - Consider affordance and interaction commonsense (e.g., containers -> into, articulated objects -> open/close).
 
 Output format:
@@ -57,7 +55,7 @@ Return JSON only, no extra text:
 
 Rules:
 - If selected template does not use target, set target_id to -1.
-- If object/target is semantically inconsistent with all detected candidates, output template_id=-1, object_id=-1, target_id=-1.
+- "template_id" and "object_id" MUST be valid indices in the template and object lists, respectively.
 """
 
 
@@ -101,97 +99,6 @@ def _parse_detected_objects(text: str) -> List[str]:
             seen.add(lowered)
             out.append(item)
     return out
-
-
-def _run_online_detected_objects(
-    device_id: str,
-    width: int,
-    height: int,
-    fps: int,
-    model: str,
-    timeout_sec: float,
-) -> List[str]:
-    import cv2
-    import numpy as np
-    import pyrealsense2 as rs
-    from openai import OpenAI
-
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("DASHSCOPE_API_KEY is not set")
-
-    pipeline = rs.pipeline()
-    config = rs.config()
-    if device_id:
-        config.enable_device(device_id)
-    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-
-    frame_rgb = None
-    try:
-        pipeline.start(config)
-        for _ in range(20):
-            pipeline.wait_for_frames()
-
-        frameset = pipeline.wait_for_frames()
-        color_frame = frameset.get_color_frame()
-        if not color_frame:
-            raise RuntimeError("Failed to read color frame from camera")
-
-        bgr = np.asanyarray(color_frame.get_data())
-        frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    finally:
-        pipeline.stop()
-
-    ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-    if not ok:
-        raise RuntimeError("Failed to encode camera frame")
-    image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
-
-    prompt_text = (
-        "You are a tabletop object detector for robot manipulation. "
-        "Ignore robot arm/gripper/body, table, environment background, walls, floor, and room context. "
-        "Output exactly one line only: comma-separated object descriptions with color, such as 'red mug, blue box'. "
-        "If no valid tabletop object, output exactly: none"
-    )
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://dashscope.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1",
-        timeout=max(1.0, float(timeout_sec)),
-    )
-
-    t_start = time.perf_counter()
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt_text},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"},
-                ],
-            }
-        ],
-        extra_body={"enable_thinking": False},
-    )
-    elapsed = time.perf_counter() - t_start
-
-    raw_text = "none"
-    for item in getattr(response, "output", []):
-        if getattr(item, "type", "") != "message":
-            continue
-        for content in getattr(item, "content", []):
-            text = getattr(content, "text", None)
-            if text:
-                raw_text = str(text).strip()
-                break
-        if raw_text != "none":
-            break
-
-    first_line = raw_text.splitlines()[0] if raw_text else "none"
-    objects = _parse_detected_objects(first_line)
-    print(f"[online-detected] elapsed={elapsed:.3f}s raw={raw_text}")
-    return objects
 
 
 def rephrase_instruction(
@@ -268,17 +175,6 @@ def main() -> None:
         default=", ".join(DEFAULT_DETECTED_OBJECTS),
         help="Comma-separated detected object candidates",
     )
-    parser.add_argument(
-        "--online-detected",
-        action="store_true",
-        help="Use camera + online VLM to replace detected object candidates",
-    )
-    parser.add_argument("--online-object-model", type=str, default="qwen3.5-plus", help="Online VLM model name")
-    parser.add_argument("--device-id", type=str, default="f1421698", help="RealSense device id")
-    parser.add_argument("--width", type=int, default=1280, help="Camera width")
-    parser.add_argument("--height", type=int, default=720, help="Camera height")
-    parser.add_argument("--fps", type=int, default=30, help="Camera fps")
-    parser.add_argument("--online-timeout-sec", type=float, default=20.0, help="Online VLM timeout in seconds")
     args = parser.parse_args()
 
     instruction = args.instruction
@@ -288,25 +184,6 @@ def main() -> None:
     detected_objects = _parse_detected_objects(args.detected_objects)
     if not detected_objects:
         detected_objects = DEFAULT_DETECTED_OBJECTS.copy()
-
-    if args.online_detected:
-        try:
-            online_objects = _run_online_detected_objects(
-                device_id=args.device_id,
-                width=args.width,
-                height=args.height,
-                fps=args.fps,
-                model=args.online_object_model,
-                timeout_sec=args.online_timeout_sec,
-            )
-            if online_objects:
-                detected_objects = online_objects
-            else:
-                detected_objects = ["none"]
-        except Exception as exc:
-            print(f"[online-detected] warning: {exc}. fallback to defaults.", file=sys.stderr)
-            if not detected_objects:
-                detected_objects = DEFAULT_DETECTED_OBJECTS.copy()
 
     result = rephrase_instruction(
         instruction=instruction,
