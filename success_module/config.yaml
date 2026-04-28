@@ -1,0 +1,34 @@
+dataset:
+  root: "dataset/custom_droid_dataset"
+  data_dir: "data/chunk-000"
+  wrist_video_dir: "videos/chunk-000/wrist_image_left"
+  fps: 15
+  parquet_pattern: "episode_*.parquet"
+  video_pattern: "episode_*.mp4"
+
+labeling:
+  label_mode: both
+  gripper_action_index: -1
+  transition_from: 0
+  transition_to: 1
+  transition_threshold: 0.5
+  positive_seconds_before_keyframe: 2.0
+  include_keyframe_in_positive: true
+  keep_only_before_keyframe: true
+  skip_no_transition_episode: true
+
+dataloader:
+  resize_hw: [224, 224]
+  normalize: true
+  rgb: true
+
+train:
+  test_size: 0.2
+  random_seed: 42
+  batch_size: 32
+  num_workers: 4
+  epochs: 10
+  early_stop_patience: 3
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  save_dir: "ckpts/success_model"
