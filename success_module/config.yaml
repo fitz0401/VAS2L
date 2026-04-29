@@ -1,5 +1,7 @@
 dataset:
-  root: "dataset/custom_droid_dataset"
+  roots:
+    - "dataset/custom_droid_dataset"
+    - "dataset/open_drawer_droid"
   data_dir: "data/chunk-000"
   wrist_video_dir: "videos/chunk-000/wrist_image_left"
   fps: 15

@@ -4,48 +4,54 @@ import argparse
 import json
 import re
 import sys
-from typing import List, Optional
+from typing import List, Optional, Sequence
 from VA2L.vlm_inference import VLMInference
 
 
 TEMPLATES = [
-    "pick the {object}",
+    "pick up the {object}",
     "place the {object} into the {target}",
     "insert the {object} into the {target}",
-    "move the {object} next to the {target}",
+    "move the {object} in the middle of the {target}",
     "open the {object}",
-    "close the {object}",
     "fold the {object}",
 ]
 
-DEFAULT_DETECTED_OBJECTS = [
+DEFAULT_OBJECT_SET = [
     "green grape",
-    "white drawer",
     "yellow teacup",
-    "blue cup",
     "marker pen",
-    "red apple"
+    "apple",
 ]
 
+DEFAULT_TARGET_SET = [
+    "white drawer",
+    "blue cup",
+    "brown box",
+    "table",
+]
 
 _SELECTION_PROMPT = """You are a robotics instruction parser.
 
 Task:
-Given a user instruction, select object/target from detected-object candidates, then do a strict selection from fixed task templates.
+Given a user instruction, select an object from the object set and optionally select a target from the target set, then do a strict selection from fixed task templates.
 
-You MUST select object_id and target_id from this list: {object_choices}
+You MUST select object_id from this object set:
+{object_choices}
+
+You MUST select target_id from this target set only if a target is needed:
+{target_choices}
 
 You MUST select exactly one template ID from this list:
-0: pick the {object}
+0: pick up the {object}
 1: place the {object} into the {target}
 2: insert the {object} into the {target}
-3: move the {object} next to the {target}
+3: move the {object} in the middle of the {target}
 4: open the {object}
-5: close the {object}
-6: fold the {object}
+5: fold the {object}
 
 Selection hint:
-- Consider spelling and phonetic similarity for object names (e.g. jar -> drawer, cup -> cap, grip -> grape, gray -> grape, door -> drawer).
+- Consider spelling and phonetic similarity for object names and target names (e.g. jar -> drawer, cup -> cap, grip -> grape, gray -> grape, door -> drawer).
 - Use semantic similarity between instruction and templates (e.g. pen -> marker, grasp -> pick).
 - Consider affordance and interaction commonsense (e.g., containers -> into, articulated objects -> open/close).
 
@@ -55,13 +61,14 @@ Return JSON only, no extra text:
 
 Rules:
 - If selected template does not use target, set target_id to -1.
-- "template_id" and "object_id" MUST be valid indices in the template and object lists, respectively.
+- If object/target is semantically inconsistent with all detected candidates, output template_id=-1, object_id=-1, target_id=-1.
 """
 
 
-def _build_selection_prompt(instruction: str, detected_objects: List[str]) -> str:
-    object_choices = "\n".join(f"{idx}: {name}" for idx, name in enumerate(detected_objects))
-    prompt = _SELECTION_PROMPT.replace("{object_choices}", object_choices)
+def _build_selection_prompt(instruction: str, object_candidates: Sequence[str], target_candidates: Sequence[str]) -> str:
+    object_choices = "\n".join(f"{idx}: {name}" for idx, name in enumerate(object_candidates)) or "(empty)"
+    target_choices = "\n".join(f"{idx}: {name}" for idx, name in enumerate(target_candidates)) or "(empty)"
+    prompt = _SELECTION_PROMPT.replace("{object_choices}", object_choices).replace("{target_choices}", target_choices)
     return f"{prompt}\nUser instruction: {instruction.strip()}\nJSON:"
 
 
@@ -101,9 +108,17 @@ def _parse_detected_objects(text: str) -> List[str]:
     return out
 
 
+def _normalize_object_set(values: Optional[Sequence[str]], default_values: Sequence[str]) -> List[str]:
+    if values is None:
+        return list(default_values)
+    normalized = [re.sub(r"\s+", " ", str(item)).strip(" .\t") for item in values]
+    return [item for item in normalized if item]
+
+
 def rephrase_instruction(
     instruction: str,
-    detected_objects: Optional[List[str]] = None,
+    object_set: Optional[Sequence[str]] = None,
+    target_set: Optional[Sequence[str]] = None,
     model: str = "qwen-vl-4b",
     model_id: str | None = None,
     device: str = "cuda:0",
@@ -115,7 +130,8 @@ def rephrase_instruction(
     if not cleaned_instruction:
         return ""
 
-    object_candidates = detected_objects or DEFAULT_DETECTED_OBJECTS
+    object_candidates = _normalize_object_set(object_set, DEFAULT_OBJECT_SET)
+    target_candidates = _normalize_object_set(target_set, DEFAULT_TARGET_SET)
     if not object_candidates:
         return "none"
 
@@ -125,7 +141,7 @@ def rephrase_instruction(
         device=device,
         precision=precision,
     )
-    raw = rewriter.infer_text(_build_selection_prompt(cleaned_instruction, object_candidates)).strip()
+    raw = rewriter.infer_text(_build_selection_prompt(cleaned_instruction, object_candidates, target_candidates)).strip()
 
     try:
         payload = json.loads(_extract_json_blob(raw))
@@ -140,12 +156,12 @@ def rephrase_instruction(
         if object_id < 0 or object_id >= len(object_candidates):
             return "none"
 
-        obj = object_candidates[object_id]        
+        obj = object_candidates[object_id]
         target = None
         if "{target}" in TEMPLATES[template_id]:
-            if target_id < 0 or target_id >= len(object_candidates):
+            if target_id < 0 or target_id >= len(target_candidates):
                 return "none"
-            target = object_candidates[target_id]
+            target = target_candidates[target_id]
         return _render_template(template_id, obj, target)
     except Exception:
         return "none"
@@ -170,10 +186,16 @@ def main() -> None:
         help="Model precision",
     )
     parser.add_argument(
-        "--detected-objects",
+        "--object-set",
         type=str,
-        default=", ".join(DEFAULT_DETECTED_OBJECTS),
-        help="Comma-separated detected object candidates",
+        default=", ".join(DEFAULT_OBJECT_SET),
+        help="Comma-separated object candidates",
+    )
+    parser.add_argument(
+        "--target-set",
+        type=str,
+        default=", ".join(DEFAULT_TARGET_SET),
+        help="Comma-separated target candidates",
     )
     args = parser.parse_args()
 
@@ -181,13 +203,18 @@ def main() -> None:
     if instruction is None:
         instruction = sys.stdin.read().strip()
 
-    detected_objects = _parse_detected_objects(args.detected_objects)
-    if not detected_objects:
-        detected_objects = DEFAULT_DETECTED_OBJECTS.copy()
+    object_set = _parse_detected_objects(args.object_set)
+    if not object_set:
+        object_set = list(DEFAULT_OBJECT_SET)
+
+    target_set = _parse_detected_objects(args.target_set)
+    if not target_set:
+        target_set = list(DEFAULT_TARGET_SET)
 
     result = rephrase_instruction(
         instruction=instruction,
-        detected_objects=detected_objects,
+        object_set=object_set,
+        target_set=target_set,
         model=args.model,
         device=args.device,
         precision=args.precision,

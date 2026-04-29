@@ -43,9 +43,7 @@ class SuccessFrameDataset(Dataset):
 		label_cfg = self.cfg["labeling"]
 		dl_cfg = self.cfg["dataloader"]
 
-		self.dataset_root = (self.repo_root / dataset_cfg["root"]).resolve()
-		self.data_dir = (self.dataset_root / dataset_cfg["data_dir"]).resolve()
-		self.wrist_video_dir = (self.dataset_root / dataset_cfg["wrist_video_dir"]).resolve()
+		self.dataset_roots = self._parse_dataset_roots(dataset_cfg)
 
 		self.fps = float(dataset_cfg.get("fps", 15))
 		self.parquet_pattern = dataset_cfg.get("parquet_pattern", "episode_*.parquet")
@@ -75,6 +73,28 @@ class SuccessFrameDataset(Dataset):
 		self.negative_ratio = self.negative_count / max(self.total_count, 1)
 
 	@staticmethod
+	def _as_path_list(value: object) -> List[str]:
+		if isinstance(value, str):
+			return [value]
+		if isinstance(value, list):
+			return [str(item) for item in value]
+		raise TypeError("dataset.root / dataset.roots must be a string or list of strings")
+
+	def _parse_dataset_roots(self, dataset_cfg: Dict) -> List[Path]:
+		if "roots" in dataset_cfg:
+			root_values = self._as_path_list(dataset_cfg["roots"])
+		elif "root" in dataset_cfg:
+			root_values = self._as_path_list(dataset_cfg["root"])
+		else:
+			raise ValueError("Missing 'root' or 'roots' in dataset config")
+
+		dataset_roots = [(self.repo_root / root_value).resolve() for root_value in root_values]
+		for dataset_root in dataset_roots:
+			if not dataset_root.exists():
+				raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
+		return dataset_roots
+
+	@staticmethod
 	def _load_config(config_path: Path) -> Dict:
 		with config_path.open("r", encoding="utf-8") as f:
 			cfg = yaml.safe_load(f) or {}
@@ -93,8 +113,9 @@ class SuccessFrameDataset(Dataset):
 		stem = p.stem
 		return int(stem.split("_")[-1])
 
-	def _video_path_for_episode(self, episode_index: int) -> Path:
-		return self.wrist_video_dir / f"episode_{episode_index:06d}.mp4"
+	def _video_path_for_episode(self, dataset_root: Path, episode_index: int) -> Path:
+		wrist_video_dir = (dataset_root / self.cfg["dataset"]["wrist_video_dir"]).resolve()
+		return wrist_video_dir / f"episode_{episode_index:06d}.mp4"
 
 	def _read_gripper_signal(self, parquet_path: Path) -> np.ndarray:
 		table = pq.read_table(parquet_path, columns=["actions"])
@@ -137,15 +158,28 @@ class SuccessFrameDataset(Dataset):
 		raise ValueError(f"Unsupported label_mode: {self.label_mode}. Expected close/open/both.")
 
 	def _build_index(self) -> None:
-		parquet_files = sorted(self.data_dir.glob(self.parquet_pattern))
-		if not parquet_files:
-			raise FileNotFoundError(f"No parquet files found under {self.data_dir} with pattern {self.parquet_pattern}")
+		parquet_files: List[Path] = []
+		for dataset_root in self.dataset_roots:
+			data_dir = (dataset_root / self.cfg["dataset"]["data_dir"]).resolve()
+			root_parquets = sorted(data_dir.glob(self.parquet_pattern))
+			if not root_parquets:
+				raise FileNotFoundError(f"No parquet files found under {data_dir} with pattern {self.parquet_pattern}")
+			parquet_files.extend(root_parquets)
 
 		pos_window = max(1, int(round(self.positive_seconds_before_keyframe * self.fps)))
 
 		for parquet_path in parquet_files:
+			matched_root = None
+			for dataset_root in self.dataset_roots:
+				data_dir = (dataset_root / self.cfg["dataset"]["data_dir"]).resolve()
+				if parquet_path.is_relative_to(data_dir):
+					matched_root = dataset_root
+					break
+			if matched_root is None:
+				continue
+
 			episode_index = self._episode_index_from_name(parquet_path)
-			video_path = self._video_path_for_episode(episode_index)
+			video_path = self._video_path_for_episode(matched_root, episode_index)
 
 			if not video_path.exists():
 				continue

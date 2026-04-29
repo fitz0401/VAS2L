@@ -87,8 +87,12 @@ def set_seed(seed: int) -> None:
 
 def split_indices_by_video(dataset: SuccessFrameDataset, test_size: float, seed: int) -> Tuple[List[int], List[int]]:
 	unique_videos = sorted({str(s.video_path) for s in dataset.samples})
+	if not unique_videos:
+		raise ValueError("Need at least 1 video to create train/test split.")
+	if test_size <= 0:
+		return list(range(len(dataset.samples))), []
 	if len(unique_videos) < 2:
-		raise ValueError("Need at least 2 videos to create train/test split.")
+		raise ValueError("Need at least 2 videos to create a non-empty test split.")
 
 	rng = random.Random(seed)
 	rng.shuffle(unique_videos)
@@ -191,7 +195,7 @@ def main() -> None:
 	batch_size = int(train_cfg.get("batch_size", 32))
 	num_workers = int(train_cfg.get("num_workers", 4))
 	train_loader = make_loader(dataset, train_indices, batch_size, num_workers, shuffle=True)
-	test_loader = make_loader(dataset, test_indices, batch_size, num_workers, shuffle=False)
+	test_loader = make_loader(dataset, test_indices, batch_size, num_workers, shuffle=False) if test_indices else None
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	model = SuccessClassifier(num_classes=2, pretrained=(not args.no_pretrained)).to(device)
@@ -228,25 +232,28 @@ def main() -> None:
 
 	for epoch in range(1, epochs + 1):
 		train_stats = run_epoch(model, train_loader, criterion, optimizer, device)
-		test_stats = run_epoch(model, test_loader, criterion, optimizer=None, device=device)
+		test_stats = run_epoch(model, test_loader, criterion, optimizer=None, device=device) if test_loader is not None else None
 
 		record = {
 			"epoch": epoch,
 			"train_loss": train_stats["loss"],
 			"train_acc": train_stats["acc"],
 			"train_ap": train_stats["ap"],
-			"test_loss": test_stats["loss"],
-			"test_acc": test_stats["acc"],
-			"test_ap": test_stats["ap"],
+			"test_loss": None if test_stats is None else test_stats["loss"],
+			"test_acc": None if test_stats is None else test_stats["acc"],
+			"test_ap": None if test_stats is None else test_stats["ap"],
 		}
 		history.append(record)
 
-		print(
-			f"[E{epoch:03d}] train_loss={record['train_loss']:.4f} train_acc={record['train_acc']:.4f} train_ap={record['train_ap']:.4f} "
-			f"test_loss={record['test_loss']:.4f} test_acc={record['test_acc']:.4f} test_ap={record['test_ap']:.4f}"
-		)
+		if test_stats is None:
+			print(f"[E{epoch:03d}] train_loss={record['train_loss']:.4f} train_acc={record['train_acc']:.4f} train_ap={record['train_ap']:.4f}")
+		else:
+			print(
+				f"[E{epoch:03d}] train_loss={record['train_loss']:.4f} train_acc={record['train_acc']:.4f} train_ap={record['train_ap']:.4f} "
+				f"test_loss={record['test_loss']:.4f} test_acc={record['test_acc']:.4f} test_ap={record['test_ap']:.4f}"
+			)
 
-		if record["test_ap"] > best_test_ap:
+		if test_stats is not None and record["test_ap"] > best_test_ap:
 			best_test_ap = record["test_ap"]
 			no_improve_epochs = 0
 			torch.save(
@@ -258,7 +265,7 @@ def main() -> None:
 				},
 				best_ckpt,
 			)
-		else:
+		elif test_stats is not None:
 			no_improve_epochs += 1
 
 		torch.save(
@@ -271,7 +278,7 @@ def main() -> None:
 			last_ckpt,
 		)
 
-		if no_improve_epochs >= patience:
+		if test_stats is not None and no_improve_epochs >= patience:
 			print(f"[INFO] Early stopping triggered after {no_improve_epochs} epochs without test AP improvement.")
 			break
 
@@ -281,7 +288,8 @@ def main() -> None:
 				"best_test_ap": best_test_ap,
 				"early_stop_patience": patience,
 				"epochs_trained": len(history),
-				"stopped_early": no_improve_epochs >= patience,
+				"stopped_early": test_stats is not None and no_improve_epochs >= patience,
+				"has_test_split": test_stats is not None,
 				"history": history,
 				"train_size": len(train_indices),
 				"test_size": len(test_indices),

@@ -10,9 +10,10 @@ from typing import Any, Dict, List, Tuple
 import zmq
 
 from VA2L.lang_rephrase import (
-	DEFAULT_DETECTED_OBJECTS,
 	_parse_detected_objects,
 	rephrase_instruction,
+	DEFAULT_OBJECT_SET,
+	DEFAULT_TARGET_SET,
 )
 from VA2L.vlm_inference import VLMInference
 
@@ -24,7 +25,7 @@ def _run_online_detected_objects(
 	fps: int,
 	model: str,
 	timeout_sec: float,
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
 	import cv2
 	import numpy as np
 	import pyrealsense2 as rs
@@ -64,8 +65,10 @@ def _run_online_detected_objects(
 	prompt_text = (
 		"You are a tabletop object detector for robot manipulation. "
 		"Ignore robot arm/gripper/body, table, environment background, walls, floor, and room context. "
-		"Output exactly one line only: comma-separated object descriptions with color, such as 'red mug, blue box'. "
-		"If no valid tabletop object, output exactly: none"
+		"Output exactly two lines only. "
+		"Line 1: comma-separated object descriptions with color, such as 'red mug, blue box'. "
+		"Line 2: comma-separated target descriptions that can be interacted with, or none if there is no target set. "
+		"If no valid object is visible, output exactly: none on line 1 and none on line 2"
 	)
 
 	client = OpenAI(
@@ -102,10 +105,16 @@ def _run_online_detected_objects(
 		if raw_text != "none":
 			break
 
-	first_line = raw_text.splitlines()[0] if raw_text else "none"
-	objects = _parse_detected_objects(first_line)
+	lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+	if not lines:
+		lines = ["none", "none"]
+	elif len(lines) == 1:
+		lines.append("none")
+
+	object_set = _parse_detected_objects(lines[0])
+	target_set = _parse_detected_objects(lines[1])
 	print(f"[online-detected] elapsed={elapsed:.3f}s raw={raw_text}")
-	return objects
+	return object_set, target_set
 
 
 def _parse_request(req_parts: List[bytes]) -> Tuple[str, Dict[str, Any]]:
@@ -150,10 +159,16 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Model precision",
 	)
 	parser.add_argument(
-		"--detected-objects",
+		"--object-set",
 		type=str,
-		default=", ".join(DEFAULT_DETECTED_OBJECTS),
+		default=", ".join(DEFAULT_OBJECT_SET),
 		help="Default comma-separated object candidates used by rephrase",
+	)
+	parser.add_argument(
+		"--target-set",
+		type=str,
+		default=", ".join(DEFAULT_TARGET_SET),
+		help="Default comma-separated target candidates used by rephrase; can be empty",
 	)
 	parser.add_argument(
 		"--online-detect",
@@ -172,13 +187,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
 	args = _build_parser().parse_args()
 
-	detected_objects = _parse_detected_objects(args.detected_objects)
-	if not detected_objects:
-		detected_objects = DEFAULT_DETECTED_OBJECTS.copy()
+	object_set = _parse_detected_objects(args.object_set)
+	target_set = _parse_detected_objects(args.target_set)
 
 	if args.online_detect:
 		try:
-			online_objects = _run_online_detected_objects(
+			online_object_set, online_target_set = _run_online_detected_objects(
 				device_id=args.device_id,
 				width=args.width,
 				height=args.height,
@@ -186,10 +200,10 @@ def main() -> None:
 				model=args.online_object_model,
 				timeout_sec=args.online_timeout_sec,
 			)
-			if online_objects:
-				detected_objects = online_objects
-			else:
-				detected_objects = ["none"]
+			if online_object_set:
+				object_set = online_object_set
+			if online_target_set:
+				target_set = online_target_set
 		except Exception as exc:
 			print(f"[online-detected] warning: {exc}. fallback to current defaults.")
 
@@ -200,7 +214,8 @@ def main() -> None:
 		device=args.device,
 		precision=args.precision,
 	)
-	print(f"Detected object candidates: {detected_objects}")
+	print(f"Detected object set: {object_set}")
+	print(f"Detected target set: {target_set}")
 
 	endpoint = f"tcp://{args.host}:{args.port}"
 	ctx = zmq.Context.instance()
@@ -224,7 +239,8 @@ def main() -> None:
 				instruction = str(payload.get("instruction", "")).strip()
 				result = rephrase_instruction(
 					instruction=instruction,
-					detected_objects=detected_objects,
+					object_set=object_set,
+					target_set=target_set,
 					model=args.model,
 					device=args.device,
 					precision=args.precision,
@@ -232,27 +248,35 @@ def main() -> None:
 				)
 				print(f"[rephrase] input={instruction if instruction else '<empty>'}")
 				print(f"[rephrase] output={result}")
-				socket.send_json({"ok": True, "result": result, "objects": detected_objects})
-			elif cmd == "set_detected_objects":
-				objects_text = payload.get("detected_objects", "")
+				socket.send_json({"ok": True, "result": result, "object_set": object_set, "target_set": target_set})
+			elif cmd == "set_object_set":
+				objects_text = payload.get("object_set", "")
 				if isinstance(objects_text, list):
 					merged = ", ".join(str(x) for x in objects_text)
 				else:
 					merged = str(objects_text)
 				parsed = _parse_detected_objects(merged)
 				if not parsed:
-					socket.send_json({"ok": False, "message": "detected_objects is empty after parsing"})
+					socket.send_json({"ok": False, "message": "object_set is empty after parsing"})
 					continue
-				detected_objects = parsed
-				socket.send_json({"ok": True, "objects": detected_objects})
-			elif cmd == "get_detected_objects":
-				socket.send_json({"ok": True, "objects": detected_objects})
+				object_set = parsed
+				socket.send_json({"ok": True, "object_set": object_set})
+			elif cmd == "set_target_set":
+				target_text = payload.get("target_set", "")
+				if isinstance(target_text, list):
+					merged = ", ".join(str(x) for x in target_text)
+				else:
+					merged = str(target_text)
+				target_set = _parse_detected_objects(merged)
+				socket.send_json({"ok": True, "target_set": target_set})
+			elif cmd == "get_sets":
+				socket.send_json({"ok": True, "object_set": object_set, "target_set": target_set})
 			else:
 				socket.send_json(
 					{
 						"ok": False,
 						"message": f"unknown command: {cmd}",
-						"supported": ["rephrase", "set_detected_objects", "get_detected_objects"],
+						"supported": ["rephrase", "set_object_set", "set_target_set", "get_sets"],
 					}
 				)
 	except KeyboardInterrupt:

@@ -112,7 +112,7 @@ class RephraseClient:
 
 def main() -> None:
 	with RephraseClient(host="127.0.0.1", port=5562, timeout_ms=8000) as client:
-		request_id = client.request_rephrase("put the gray in the jar")
+		request_id = client.request_rephrase("put the pen in the cup")
 		print(f"sent request_id={request_id}")
 
 		# Non-blocking behavior: request is sent, caller can continue immediately.
