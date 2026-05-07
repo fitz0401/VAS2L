@@ -20,7 +20,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 from torchvision.models import ResNet18_Weights, resnet18
 from sklearn.metrics import average_precision_score
-
+from success_module.data_augmentation import AugmentedSubset
 from success_module.success_dataloader import SuccessFrameDataset
 
 
@@ -194,9 +194,22 @@ def main() -> None:
 
 	batch_size = int(train_cfg.get("batch_size", 32))
 	num_workers = int(train_cfg.get("num_workers", 4))
-	train_loader = make_loader(dataset, train_indices, batch_size, num_workers, shuffle=True)
-	test_loader = make_loader(dataset, test_indices, batch_size, num_workers, shuffle=False) if test_indices else None
-
+	enable_augmentation = bool(train_cfg.get("enable_augmentation", False))
+	if enable_augmentation:
+		print("[INFO] Data augmentation enabled for training set.")
+		train_loader = DataLoader(
+			AugmentedSubset(dataset, train_indices, augment=True),
+			batch_size=batch_size, shuffle=True,
+			num_workers=num_workers, pin_memory=True,
+		)
+		test_loader = DataLoader(
+			AugmentedSubset(dataset, test_indices, augment=False),
+			batch_size=batch_size, shuffle=False,
+			num_workers=num_workers, pin_memory=True,
+		) if test_indices else None
+	else:
+		train_loader = make_loader(dataset, train_indices, batch_size, num_workers, shuffle=True)
+		test_loader = make_loader(dataset, test_indices, batch_size, num_workers, shuffle=False) if test_indices else None
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	model = SuccessClassifier(num_classes=2, pretrained=(not args.no_pretrained)).to(device)
 
@@ -219,6 +232,8 @@ def main() -> None:
 	metrics_path = save_dir / "metrics.json"
 
 	history: List[Dict] = []
+	train_video_indices = sorted({int(Path(dataset.samples[i].video_path).stem.split("_")[-1]) for i in train_indices})
+	test_video_indices = sorted({int(Path(dataset.samples[i].video_path).stem.split("_")[-1]) for i in test_indices})
 
 	print(f"[INFO] Dataset frames: {len(dataset)}")
 	print(f"[INFO] Positive samples: {dataset.positive_count}")
@@ -226,8 +241,8 @@ def main() -> None:
 	print(f"[INFO] Positive ratio: {dataset.positive_ratio:.4f}")
 	print(f"[INFO] Negative ratio: {dataset.negative_ratio:.4f}")
 	print(f"[INFO] Train frames: {len(train_indices)} | Test frames: {len(test_indices)}")
-	print(f"[INFO] Train videos: {len({str(dataset.samples[i].video_path) for i in train_indices})}")
-	print(f"[INFO] Test videos: {len({str(dataset.samples[i].video_path) for i in test_indices})}")
+	print(f"[INFO] Train videos: {len(train_video_indices)} | indices={train_video_indices}")
+	print(f"[INFO] Test videos: {len(test_video_indices)} | indices={test_video_indices}")
 	print(f"[INFO] Device: {device}")
 
 	for epoch in range(1, epochs + 1):

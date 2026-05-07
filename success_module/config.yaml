@@ -9,7 +9,7 @@ dataset:
   video_pattern: "episode_*.mp4"
 
 labeling:
-  label_mode: both
+  label_mode: open
   gripper_action_index: -1
   transition_from: 0
   transition_to: 1
@@ -25,7 +25,7 @@ dataloader:
   rgb: true
 
 train:
-  test_size: 0.2
+  test_size: 0.0
   random_seed: 42
   batch_size: 32
   num_workers: 4
@@ -33,4 +33,5 @@ train:
   early_stop_patience: 3
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
+  enable_augmentation: True
   save_dir: "ckpts/success_model"

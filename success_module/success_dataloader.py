@@ -157,6 +157,12 @@ class SuccessFrameDataset(Dataset):
 			return unique
 		raise ValueError(f"Unsupported label_mode: {self.label_mode}. Expected close/open/both.")
 
+	def _open_segment_bounds(self, signal: np.ndarray, open_keyframe: int) -> Tuple[int, int]:
+		close_keyframes = self._find_keyframes(signal, self.transition_from, self.transition_to)
+		if close_keyframes and close_keyframes[0] < open_keyframe:
+			return close_keyframes[0], open_keyframe
+		return 0, open_keyframe
+
 	def _build_index(self) -> None:
 		parquet_files: List[Path] = []
 		for dataset_root in self.dataset_roots:
@@ -165,8 +171,6 @@ class SuccessFrameDataset(Dataset):
 			if not root_parquets:
 				raise FileNotFoundError(f"No parquet files found under {data_dir} with pattern {self.parquet_pattern}")
 			parquet_files.extend(root_parquets)
-
-		pos_window = max(1, int(round(self.positive_seconds_before_keyframe * self.fps)))
 
 		for parquet_path in parquet_files:
 			matched_root = None
@@ -191,9 +195,19 @@ class SuccessFrameDataset(Dataset):
 					continue
 				keyframes = [(len(signal) - 1, "close")]
 
+			# Override positive window for open_drawer_droid in open mode.
+			if self.label_mode == "open" and "open_drawer_droid" in matched_root.as_posix():
+				pos_window = max(1, int(round(0.5 * self.fps)))
+			else:
+				pos_window = max(1, int(round(self.positive_seconds_before_keyframe * self.fps)))
+
 			for segment_index, (keyframe, transition_type) in enumerate(keyframes):
-				segment_start = 0 if segment_index == 0 else keyframes[segment_index - 1][0] + 1
-				segment_end = keyframe if self.keep_only_before_keyframe or self.label_mode == "both" else len(signal) - 1
+				if self.label_mode == "open":
+					segment_start, segment_end = self._open_segment_bounds(signal, keyframe)
+				else:
+					segment_start = 0 if segment_index == 0 else keyframes[segment_index - 1][0] + 1
+					segment_end = keyframe if self.keep_only_before_keyframe or self.label_mode == "both" else len(signal) - 1
+				
 				segment_end = min(segment_end, len(signal) - 1)
 				if segment_start > segment_end:
 					continue
